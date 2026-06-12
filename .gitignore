@@ -1,0 +1,8 @@
+.DS_Store
+__pycache__/
+*.pyc
+downloads/
+.venv/
+.komiic_gui_config.json
+.komiic_playwright_profile/
+gui_server.log
