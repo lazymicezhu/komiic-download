@@ -1,155 +1,131 @@
 # Komiic 漫画下载器
 
-一个用于学习测试的 Komiic 漫画下载工具，提供本地 GUI 页面和 CLI 两种方式。当前版本只使用 Komiic 页面实际调用的 API 获取章节、图片列表和图片 ticket，不再依赖浏览器页面渲染或滚动抓取。
+简体中文 | [English](README.en.md)
 
-请只在你已获得授权的前提下使用；不要绕过登录、付费、访问限制或反爬策略。默认配置会限速，并跳过已存在文件，方便断点续下。
+一个提供本地网页界面和命令行的 Komiic 漫画下载工具，支持单本与批量下载、断点续传，以及适用于 Panels 等阅读器的 CBZ 导出。章节和图片信息通过 Komiic 页面使用的 API 获取，无需滚动抓取页面。
 
-## 安装
+## 功能
+
+- **单本与批量下载**：选择章节、估算所需图片额度，批量队列支持运行中追加链接。
+- **断点续传**：跳过已有图片，补齐未完成章节，下载后检查完整性并重试失败项。
+- **账号与额度管理**：管理登录 Cookie、切换账号、查看剩余额度及历史变化。
+- **漫画与任务记录**：查看本地漫画预览、关注漫画和下载任务状态。
+- **CBZ 导出与复制**：完整章节自动打包，可手动复制或在下载完成后复制到指定目录。
+
+支持 `komiic.com` 和 `komiic.cc`。请仅下载你有权访问的内容，并遵守站点的使用规则与访问限制。
+
+## 快速开始
 
 ```bash
+git clone https://github.com/lazymicezhu/komiic-download.git
+cd komiic-download
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-```
-
-## 启动 GUI
-
-```bash
+python -m pip install -r requirements.txt
 python gui_server.py
 ```
 
-然后打开：
+在浏览器打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。使用期间保持服务运行；下次启动时，在项目目录激活虚拟环境后运行 `python gui_server.py` 即可。
 
-```text
-http://127.0.0.1:8787
+如需使用浏览器登录获取 Cookie，可安装 Playwright 浏览器：
+
+```bash
+python -m playwright install chromium
 ```
 
-GUI 支持：
+手动粘贴 Cookie 和命令行下载无需安装该浏览器。端口被占用时，可用 `PORT=8788 python gui_server.py` 指定其他端口。
 
-- 输入漫画详情页链接或章节链接。
-- 在 `https://komiic.cc/`（国内直连）和 `https://komiic.com/` 之间切换。
-- 输入登录 Cookie，用授权账号请求 API；查询额度成功后会保存到本机项目配置。
-- 查询当前账号剩余图片额度。
-- 额度记录页面会每 1 分钟自动拉取并保存额度变化。
-- 历史记录页面会显示已保存漫画的前三张本地预览图，可一键选择漫画并获取章节检查更新，也可以删除历史记录。
-- 设置或选择输出目录。频繁更改输出目录会导致程序读不到旧目录，可能把已下载章节判断为未下载并重复下载。
-- 获取章节列表，并勾选指定章节下载。
-- 实时查看下载日志。
-- 停止当前任务。
+## 网页界面
 
-## CLI 下载整部漫画
+1. 在“账号池”中添加自己的登录 Cookie，或通过浏览器登录获取 Cookie。
+2. 选择站点和输出目录，输入漫画链接并获取章节。
+3. 勾选所需章节后开始下载，通过日志查看进度和错误。
+
+批量下载时，每行输入一个漫画链接，可先估算额度，再开始下载；运行期间支持追加链接。程序按顺序处理漫画，跳过已完整章节，并在结束后检查缺失章节。
+
+账号池在两个站点间共享。当前账号额度耗尽时，程序会尝试其他已启用账号。额度记录在服务运行期间定期更新。
+
+“历史记录”可查看漫画预览、重新获取章节和标记关注；“下载任务”可查看任务状态。关注是便于筛选的标记，不会自动下载更新。历史预览使用默认下载目录，建议与实际输出目录保持一致。
+
+## 下载目录与 CBZ
+
+默认下载到项目的 `downloads` 目录，图片按漫画和章节整理：
+
+```text
+downloads/
+└── 漫画名/
+    ├── 漫画名_01_19p/
+    │   ├── 001.jpg
+    │   └── ...
+    └── 漫画名_panels_cbz/
+        └── 漫画名_01_19p.cbz
+```
+
+只有图片完整的章节才会生成 CBZ。重新运行同一任务时会跳过已有图片，因此续传时应保持输出目录不变。
+
+如需设置默认下载位置或将 CBZ 复制到阅读器的导入目录，在项目根目录创建 `.komiic_local_paths.json`：
+
+```json
+{
+  "downloadDir": "downloads",
+  "cbzCopyTarget": "/path/to/CBZ-Inbox"
+}
+```
+
+| 配置 | 说明 |
+| --- | --- |
+| `downloadDir` | GUI 默认下载目录；相对路径以项目根目录为基准，也可使用绝对路径。 |
+| `cbzCopyTarget` | CBZ 复制目标；替换为自己的绝对路径，并提前创建目录。 |
+
+修改后重启服务。可通过“复制 CBZ”按钮或下载完成后的复制选项，将新增 CBZ 复制到目标目录；源文件会保留。关闭复制不影响章节自动打包。
+
+## 命令行
+
+下载整部漫画：
 
 ```bash
 python komiic_downloader.py "https://komiic.com/comic/1088" -o downloads
 ```
 
-默认会下载全部已有章节。
-
-如果要使用国内直连站点：
-
-```bash
-python komiic_downloader.py "https://komiic.cc/comic/1088" -o downloads --base-url https://komiic.cc
-```
-
-## CLI 只测试一个章节
-
-```bash
-python komiic_downloader.py "章节链接" -o downloads/test_chapter --single-chapter
-```
-
-## CLI 下载指定章节
-
-先在 GUI 里点“获取章节”查看章节 ID，或从章节链接里取 `/chapter/{id}/` 的 ID。多个章节用英文逗号分隔：
+下载指定章节，章节 ID 可从章节链接的 `/chapter/{id}/` 获取：
 
 ```bash
 python komiic_downloader.py "https://komiic.com/comic/1088" \
-  -o downloads \
-  --chapter-ids 19836,19837,19838
+  -o downloads --chapter-ids 19836,19837,19838
 ```
 
-## 使用登录 Cookie
-
-不要在聊天里发送账号密码或 Cookie。Cookie 等同于登录凭证，只在本机 GUI 或终端里使用。
-
-GUI 会在“查询剩余额度”成功后，把当前站点的 Cookie 明文保存到项目本地 `.komiic_gui_config.json`。该文件已加入 `.gitignore`，但仍应只在你的本机保存。
-
-在浏览器里复制 Cookie 的常用方式：
-
-1. 登录 Komiic。
-2. 打开开发者工具。
-3. 进入 Network/网络面板。
-4. 刷新页面，点开一个发往 `https://komiic.com/api/query` 的请求。
-5. 在 Request Headers/请求标头里复制 `Cookie` 这一项的值。
-6. 粘贴到 GUI 的“登录 Cookie”输入框。
-
-CLI 也支持通过环境变量传入：
+下载单个章节，或将已有下载导出为 CBZ：
 
 ```bash
-KOMIIC_COOKIE='这里粘贴 Cookie 请求头的值' \
-python komiic_downloader.py "https://komiic.com/comic/1088" -o downloads/komiic_1088
-```
-
-## CLI 常用选项
-
-```bash
-python komiic_downloader.py "https://komiic.com/comic/1088" \
-  --base-url https://komiic.com \
-  --chapter-delay 5 \
-  --image-delay 1 \
-  --image-retries 2 \
-  --retry-delay 2 \
-  --max-chapters 3
-```
-
-- `--base-url`：选择 API 和 Referer 使用的站点，只支持 `https://komiic.com` 或 `https://komiic.cc`。
-- `--single-chapter`：把传入链接当作章节页，只下载这一章。
-- `--chapter-ids`：只下载指定章节 ID，多个 ID 用英文逗号分隔。
-- `--max-chapters`：限制最多下载多少章；不传或传 `0` 表示下载全部已有章节。
-- `--image-retries`：单张图片立即尝试次数，默认 `2`，也就是失败后立刻重试 1 次。
-- `--retry-delay`：图片立即重试基础等待秒数，默认 `2`，每次重试会递增等待。章节末尾还会对失败图片整体补试 2 轮。
-
-## 断点续传
-
-下载目录会先按漫画名分组，再按稳定章节名保存：
-
-```text
-输出目录/漫画名/漫画名_章节名_几p
-```
-
-例如：
-
-```text
-downloads/在超市后门吸烟的二人/在超市后门吸烟的二人_01_19p/001.jpg
-```
-
-漫画名会优先使用 API 返回的标题，并通过 OpenCC 转为简体中文后用于目录名。
-
-重新运行同一任务时，脚本会先检查本地已存在图片，只对缺失图片申请图片 ticket，避免因为已下载文件重复消耗图片额度。
-
-旧版本生成的 `001_14 15p` 或 `14 15p_19849` 这类目录，如果能唯一匹配到当前章节，会自动迁移为新的稳定目录名。
-
-## Panels / CBZ 导入
-
-每个章节下载完成后，会自动在漫画目录下生成 Panels 可导入的 CBZ：
-
-```text
-downloads/漫画名/漫画名_panels_cbz/漫画名_01_19p.cbz
-```
-
-CBZ 内部只包含页码图片文件，例如 `001.jpg`、`002.jpg`，不包含外层目录或 `.DS_Store`。
-
-只有章节图片完整时才会生成 CBZ；如果有图片最终下载失败，日志会列出失败页码并跳过该章节 CBZ。
-
-如果要把已经下载好的章节批量生成 CBZ：
-
-```bash
+python komiic_downloader.py "章节链接" -o downloads --single-chapter
 python komiic_downloader.py --export-existing-cbz downloads
 ```
 
-## 运行注意
+登录凭证通过环境变量传入：
 
-- 如果 GUI 页面显示任务失败，先看右侧日志。常见原因是网络不稳定、站点限流、Cookie 失效、图片 ticket 过期或图片额度不足。
-- 如果日志里出现 `Connection reset by peer`，通常是图片 CDN 断开连接。当前版本会立即重试一次，并在章节末尾补试两轮。
-- 如果日志里出现 `429 Too Many Requests`，表示图片 CDN 限速。当前版本会自动冷却等待后再试；继续频繁出现时，暂停一段时间后重新运行即可，已存在图片会跳过。
-- 下载日志中的 `(53/66)` 表示当前章节第 53 张，共 66 张。
-- 下载时会后台预取下一批图片 ticket，同时下载当前批次，减少“找到图片”后的等待。
+```bash
+KOMIIC_COOKIE='这里粘贴 Cookie 请求头的值' \
+python komiic_downloader.py "https://komiic.com/comic/1088" -o downloads
+```
+
+| 常用参数 | 说明 |
+| --- | --- |
+| `--base-url` | 选择 `https://komiic.com` 或 `https://komiic.cc`；使用 `.cc` 链接时也需指定对应站点。 |
+| `--max-chapters` | 最多下载的章节数，默认 `0` 表示全部。 |
+| `--chapter-delay` | 章节间隔秒数，默认 `5`。 |
+| `--image-delay` | 图片间隔秒数，默认 `1`。 |
+| `--image-retries` | 每张图片的立即尝试次数，默认 `2`。 |
+| `--retry-delay` | 立即重试的基础等待秒数，默认 `2`。 |
+
+运行 `python komiic_downloader.py --help` 查看全部参数。独立 CLI 不读取 GUI 的账号池或路径配置，请通过 `KOMIIC_COOKIE` 和 `-o` 指定。
+
+## 常见问题
+
+- **下载失败或连接被重置**：先查看日志。程序会重试失败图片；仍失败时，可稍后用相同目录重新运行以续传。
+- **出现 HTTP 429 或额度不足**：等待限流冷却或额度重置后继续，已有文件会保留。
+- **CBZ 没有生成**：检查对应章节是否仍有缺失图片。
+- **CBZ 复制失败**：检查目标目录是否已配置、存在且可写；修改路径配置后需重启服务。
+
+## 本地数据
+
+账号 Cookie、额度与下载历史保存在 `.komiic_gui_config.json`，Cookie 为明文；浏览器登录资料保存在 `.komiic_playwright_profile/`。这些文件、路径配置和下载内容已被 Git 忽略，请保留在本机，不要上传或分享登录凭证。

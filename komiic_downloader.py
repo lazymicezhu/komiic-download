@@ -29,6 +29,7 @@ IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".avif")
 CBZ_DIR_SUFFIX = "panels_cbz"
 ALLOWED_BASE_URLS = ("https://komiic.com", "https://komiic.cc")
 DEFAULT_BASE_URL = "https://komiic.com"
+QUOTA_EXCEEDED_EXIT_CODE = 75
 _OPENCC = None
 
 
@@ -777,6 +778,7 @@ def run(args: argparse.Namespace) -> int:
     except QuotaExceeded as exc:
         print(f"\n已暂停: {exc}", flush=True)
         print("已下载的文件会保留。配额重置后重新运行同一任务，会自动跳过已存在文件继续下载。", flush=True)
+        return QUOTA_EXCEEDED_EXIT_CODE
 
     return 0
 

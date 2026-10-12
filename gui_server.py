@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import json
+import html
 import mimetypes
 import os
 import signal
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -23,6 +26,7 @@ from komiic_downloader import (
     format_reset_time,
     get_chapters,
     get_image_limit,
+    QUOTA_EXCEEDED_EXIT_CODE,
     normalize_base_url,
     parse_comic_id,
     safe_name,
@@ -33,10 +37,29 @@ from komiic_downloader import (
 ROOT = Path(__file__).resolve().parent
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8787
-DEFAULT_OUTPUT = "downloads"
+LOCAL_PATHS_PATH = ROOT / ".komiic_local_paths.json"
+FALLBACK_OUTPUT = "downloads"
 CONFIG_PATH = ROOT / ".komiic_gui_config.json"
 PLAYWRIGHT_PROFILE_DIR = ROOT / ".komiic_playwright_profile"
 CONFIG_LOCK = threading.Lock()
+COOKIE_REFRESH_LOCK = threading.Lock()
+ACCOUNT_POOL_KEY = "shared"
+COOKIE_REFRESH_MIN_INTERVAL = 300
+
+
+def load_local_paths() -> dict:
+    if not LOCAL_PATHS_PATH.exists():
+        return {}
+    try:
+        data = json.loads(LOCAL_PATHS_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+_LOCAL_PATHS = load_local_paths()
+DEFAULT_OUTPUT = str(_LOCAL_PATHS.get("downloadDir") or FALLBACK_OUTPUT)
+DEFAULT_CBZ_COPY_TARGET = str(_LOCAL_PATHS.get("cbzCopyTarget") or "")
 
 
 class JobState:
@@ -53,7 +76,7 @@ class JobState:
 
     def snapshot(self) -> dict:
         with self.lock:
-            running = self.process is not None and self.process.poll() is None
+            running = self.status == "running" or (self.process is not None and self.process.poll() is None)
             return {
                 "running": running,
                 "status": self.status,
@@ -126,6 +149,7 @@ class CookieLoginState:
         self.base_url = ""
         self.cookie = ""
         self.cookie_count = 0
+        self.profile_available = False
         self.error = ""
 
     def snapshot(self) -> dict:
@@ -138,6 +162,7 @@ class CookieLoginState:
                 "baseUrl": self.base_url,
                 "cookie": self.cookie,
                 "cookieCount": self.cookie_count,
+                "profileAvailable": self.profile_available,
                 "error": self.error,
             }
 
@@ -149,8 +174,13 @@ def default_config() -> dict:
     return {
         "baseUrl": DEFAULT_BASE_URL,
         "cookies": {base_url: "" for base_url in ALLOWED_BASE_URLS},
+        "accountPools": {ACCOUNT_POOL_KEY: []},
+        "activeAccounts": {ACCOUNT_POOL_KEY: ""},
         "comics": [],
         "quotaHistory": [],
+        "downloadHistory": [],
+        "followComics": [],
+        "cbzCopySince": 0,
     }
 
 
@@ -174,6 +204,111 @@ def normalize_comic_history_item(comic: dict, default_base_url: str) -> dict | N
     }
 
 
+def normalize_follow_comic(item: dict, default_base_url: str) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    try:
+        base_url = normalize_base_url(str(item.get("baseUrl") or default_base_url))
+    except ValueError:
+        base_url = default_base_url
+    comic_id = str(item.get("comicId") or "").strip()
+    if not comic_id:
+        return None
+    return {"baseUrl": base_url, "comicId": comic_id}
+
+
+def normalize_account_item(account: dict, fallback_index: int = 1) -> dict | None:
+    cookie = str(account.get("cookie") or "").strip()
+    if not cookie:
+        return None
+    account_id = str(account.get("id") or "").strip() or uuid.uuid4().hex
+    name = str(account.get("name") or "").strip() or f"账号 {fallback_index}"
+    return {
+        "id": account_id,
+        "name": name[:60],
+        "cookie": cookie,
+        "enabled": bool(account.get("enabled", True)),
+        "lastRemaining": int(account.get("lastRemaining") or 0),
+        "lastUsage": int(account.get("lastUsage") or 0),
+        "lastLimit": int(account.get("lastLimit") or 0),
+        "lastCheckedAt": float(account.get("lastCheckedAt") or 0),
+        "lastCookieRefreshAt": float(account.get("lastCookieRefreshAt") or 0),
+        "playwrightProfile": bool(account.get("playwrightProfile", False)),
+        "lastResetInSeconds": account.get("lastResetInSeconds"),
+        "lastResetText": str(account.get("lastResetText") or ""),
+        "lastError": str(account.get("lastError") or ""),
+    }
+
+
+def account_pool_key(_: str = "") -> str:
+    return ACCOUNT_POOL_KEY
+
+
+def merged_account_pool(raw_pools: dict, raw_cookies: dict | None = None) -> list[dict]:
+    accounts: list[dict] = []
+    seen_ids: set[str] = set()
+    sources = [ACCOUNT_POOL_KEY, *ALLOWED_BASE_URLS]
+    for source in sources:
+        for account in raw_pools.get(source) or []:
+            if not isinstance(account, dict):
+                continue
+            item = normalize_account_item(account, len(accounts) + 1)
+            if not item:
+                continue
+            if item["id"] in seen_ids:
+                item["id"] = uuid.uuid4().hex
+            seen_ids.add(item["id"])
+            accounts.append(item)
+    if raw_cookies:
+        existing_cookies = {str(account.get("cookie") or "").strip() for account in accounts if str(account.get("cookie") or "").strip()}
+        for base_url in ALLOWED_BASE_URLS:
+            cookie = str(raw_cookies.get(base_url) or "").strip()
+            if not cookie or cookie in existing_cookies:
+                continue
+            account_id = "default" if not accounts and "default" not in seen_ids else uuid.uuid4().hex
+            seen_ids.add(account_id)
+            accounts.append(
+                {
+                    "id": account_id,
+                    "name": "默认账号",
+                    "cookie": cookie,
+                    "enabled": True,
+                    "lastRemaining": 0,
+                    "lastUsage": 0,
+                    "lastLimit": 0,
+                    "lastCheckedAt": 0,
+                    "lastCookieRefreshAt": 0,
+                    "playwrightProfile": False,
+                    "lastResetInSeconds": None,
+                    "lastResetText": "",
+                    "lastError": "",
+                }
+            )
+            existing_cookies.add(cookie)
+    return accounts[:50]
+
+
+def normalize_download_history_item(item: dict) -> dict | None:
+    url = str(item.get("url") or "").strip()
+    if not url:
+        return None
+    return {
+        "id": str(item.get("id") or "").strip() or uuid.uuid4().hex,
+        "type": str(item.get("type") or "single"),
+        "url": url,
+        "title": str(item.get("title") or url).strip(),
+        "baseUrl": str(item.get("baseUrl") or DEFAULT_BASE_URL),
+        "status": str(item.get("status") or "queued"),
+        "downloaded": int(item.get("downloaded") or 0),
+        "missing": int(item.get("missing") or 0),
+        "total": int(item.get("total") or 0),
+        "message": str(item.get("message") or ""),
+        "startedAt": float(item.get("startedAt") or time.time()),
+        "updatedAt": float(item.get("updatedAt") or time.time()),
+        "finishedAt": item.get("finishedAt"),
+    }
+
+
 def load_config() -> dict:
     config = default_config()
     with CONFIG_LOCK:
@@ -191,6 +326,21 @@ def load_config() -> dict:
                 if isinstance(cookies, dict):
                     for base_url in ALLOWED_BASE_URLS:
                         config["cookies"][base_url] = str(cookies.get(base_url) or "")
+                account_pools = loaded.get("accountPools")
+                if isinstance(account_pools, dict):
+                    config["accountPools"][ACCOUNT_POOL_KEY] = merged_account_pool(account_pools, config["cookies"])
+                elif any(config["cookies"].get(base_url) for base_url in ALLOWED_BASE_URLS):
+                    config["accountPools"][ACCOUNT_POOL_KEY] = merged_account_pool({}, config["cookies"])
+                active_accounts = loaded.get("activeAccounts")
+                account_ids = {account["id"] for account in config["accountPools"].get(ACCOUNT_POOL_KEY, [])}
+                if isinstance(active_accounts, dict):
+                    for key in (ACCOUNT_POOL_KEY, *ALLOWED_BASE_URLS):
+                        active_id = str(active_accounts.get(key) or "").strip()
+                        if active_id in account_ids:
+                            config["activeAccounts"][ACCOUNT_POOL_KEY] = active_id
+                            break
+                if not config["activeAccounts"].get(ACCOUNT_POOL_KEY) and config["accountPools"].get(ACCOUNT_POOL_KEY):
+                    config["activeAccounts"][ACCOUNT_POOL_KEY] = config["accountPools"][ACCOUNT_POOL_KEY][0]["id"]
                 comics = loaded.get("comics")
                 if isinstance(comics, list):
                     normalized_comics = []
@@ -207,6 +357,21 @@ def load_config() -> dict:
                         for item in quota_history
                         if isinstance(item, dict) and item.get("baseUrl") in ALLOWED_BASE_URLS
                     ][-500:]
+                download_history = loaded.get("downloadHistory")
+                if isinstance(download_history, list):
+                    config["downloadHistory"] = [
+                        item
+                        for item in (normalize_download_history_item(entry) for entry in download_history if isinstance(entry, dict))
+                        if item
+                    ][-500:]
+                follow_comics = loaded.get("followComics")
+                if isinstance(follow_comics, list):
+                    config["followComics"] = [
+                        item
+                        for item in (normalize_follow_comic(entry, config["baseUrl"]) for entry in follow_comics if isinstance(entry, dict))
+                        if item
+                    ][:200]
+                config["cbzCopySince"] = float(loaded.get("cbzCopySince") or 0)
     return config
 
 
@@ -220,6 +385,26 @@ def save_config(config: dict) -> None:
     if isinstance(cookies, dict):
         for base_url in ALLOWED_BASE_URLS:
             cleaned["cookies"][base_url] = str(cookies.get(base_url) or "")
+    account_pools = config.get("accountPools")
+    if isinstance(account_pools, dict):
+        accounts = merged_account_pool(account_pools)
+        cleaned["accountPools"][ACCOUNT_POOL_KEY] = accounts
+        account_ids = {account["id"] for account in accounts}
+        active_id = str((config.get("activeAccounts") or {}).get(ACCOUNT_POOL_KEY) or "").strip()
+        if active_id not in account_ids:
+            for key in ALLOWED_BASE_URLS:
+                candidate = str((config.get("activeAccounts") or {}).get(key) or "").strip()
+                if candidate in account_ids:
+                    active_id = candidate
+                    break
+        if active_id in account_ids:
+            cleaned["activeAccounts"][ACCOUNT_POOL_KEY] = active_id
+        elif accounts:
+            cleaned["activeAccounts"][ACCOUNT_POOL_KEY] = accounts[0]["id"]
+        active = next((account for account in accounts if account["id"] == cleaned["activeAccounts"][ACCOUNT_POOL_KEY]), None)
+        if active:
+            for base_url in ALLOWED_BASE_URLS:
+                cleaned["cookies"][base_url] = active["cookie"]
     comics = config.get("comics")
     if isinstance(comics, list):
         normalized_comics = []
@@ -251,6 +436,27 @@ def save_config(config: dict) -> None:
             for item in quota_history
             if isinstance(item, dict)
         ][-500:]
+    download_history = config.get("downloadHistory")
+    if isinstance(download_history, list):
+        cleaned["downloadHistory"] = [
+            item
+            for item in (normalize_download_history_item(entry) for entry in download_history if isinstance(entry, dict))
+            if item
+        ][:500]
+    follow_comics = config.get("followComics")
+    if isinstance(follow_comics, list):
+        seen_follows = set()
+        follows = []
+        for item in (normalize_follow_comic(entry, cleaned["baseUrl"]) for entry in follow_comics if isinstance(entry, dict)):
+            if not item:
+                continue
+            key = (item["baseUrl"], item["comicId"])
+            if key in seen_follows:
+                continue
+            seen_follows.add(key)
+            follows.append(item)
+        cleaned["followComics"] = follows[:200]
+    cleaned["cbzCopySince"] = float(config.get("cbzCopySince") or 0)
 
     with CONFIG_LOCK:
         CONFIG_PATH.write_text(
@@ -262,26 +468,273 @@ def save_config(config: dict) -> None:
 def config_payload(base_url: str = "") -> dict:
     config = load_config()
     selected_base_url = normalize_base_url(base_url or str(config.get("baseUrl") or DEFAULT_BASE_URL))
+    accounts = config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    active_id = str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "")
+    active = next((account for account in accounts if account.get("id") == active_id), None)
     return {
         "baseUrl": selected_base_url,
         "allowedBaseUrls": list(ALLOWED_BASE_URLS),
-        "cookie": str((config.get("cookies") or {}).get(selected_base_url) or ""),
+        "cookie": str((active or {}).get("cookie") or (config.get("cookies") or {}).get(selected_base_url) or ""),
+        "accounts": account_pool_payload(selected_base_url)["accounts"],
+        "activeAccountId": active_id,
         "comics": config.get("comics") or [],
     }
 
 
 def saved_cookie(base_url: str) -> str:
     config = load_config()
-    return str((config.get("cookies") or {}).get(normalize_base_url(base_url)) or "")
+    selected_base_url = normalize_base_url(base_url)
+    accounts = config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    active_id = str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "")
+    active = next((account for account in accounts if account.get("id") == active_id and account.get("enabled", True)), None)
+    return str((active or {}).get("cookie") or (config.get("cookies") or {}).get(selected_base_url) or "")
 
 
 def remember_cookie(base_url: str, cookie: str) -> None:
     config = load_config()
     selected_base_url = normalize_base_url(base_url)
-    cookies = config.setdefault("cookies", {})
-    cookies[selected_base_url] = cookie.strip()
+    cookie = cookie.strip()
+    config.setdefault("cookies", {})[selected_base_url] = cookie
+    accounts = config.setdefault("accountPools", {}).setdefault(ACCOUNT_POOL_KEY, [])
+    if cookie and not accounts:
+        account = {
+            "id": "default",
+            "name": "默认账号",
+            "cookie": cookie,
+            "enabled": True,
+            "lastRemaining": 0,
+            "lastUsage": 0,
+            "lastLimit": 0,
+            "lastCheckedAt": 0,
+            "lastCookieRefreshAt": 0,
+            "playwrightProfile": False,
+            "lastResetInSeconds": None,
+            "lastResetText": "",
+            "lastError": "",
+        }
+        accounts.insert(0, account)
+        config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = account["id"]
     config["baseUrl"] = selected_base_url
     save_config(config)
+
+
+def account_pool_payload(base_url: str = "") -> dict:
+    config = load_config()
+    selected_base_url = normalize_base_url(base_url or str(config.get("baseUrl") or DEFAULT_BASE_URL))
+    active_id = str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "")
+    accounts = []
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        cookie = str(account.get("cookie") or "")
+        accounts.append(
+            {
+                "id": account.get("id"),
+                "name": account.get("name"),
+                "enabled": account.get("enabled", True),
+                "active": account.get("id") == active_id,
+                "hasCookie": bool(cookie),
+                "cookiePreview": f"{cookie[:18]}..." if cookie else "",
+                "lastRemaining": account.get("lastRemaining", 0),
+                "lastUsage": account.get("lastUsage", 0),
+                "lastLimit": account.get("lastLimit", 0),
+                "lastCheckedAt": account.get("lastCheckedAt", 0),
+                "lastCookieRefreshAt": account.get("lastCookieRefreshAt", 0),
+                "playwrightProfile": account.get("playwrightProfile", False),
+                "lastResetInSeconds": account.get("lastResetInSeconds"),
+                "lastResetText": account.get("lastResetText", ""),
+                "lastError": account.get("lastError", ""),
+            }
+        )
+    return {"baseUrl": selected_base_url, "activeAccountId": active_id, "accounts": accounts}
+
+
+def update_accounts(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    raw_accounts = payload.get("accounts")
+    if not isinstance(raw_accounts, list):
+        raise ValueError("账号列表格式错误")
+    accounts = []
+    for index, account in enumerate(raw_accounts, start=1):
+        if not isinstance(account, dict):
+            continue
+        item = normalize_account_item(account, index)
+        if item:
+            accounts.append(item)
+    config = load_config()
+    config.setdefault("accountPools", {})[ACCOUNT_POOL_KEY] = accounts[:50]
+    active_id = str(payload.get("activeAccountId") or "").strip()
+    if active_id and any(account["id"] == active_id for account in accounts):
+        config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = active_id
+    elif accounts:
+        config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = accounts[0]["id"]
+    else:
+        config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = ""
+        config.setdefault("cookies", {})[selected_base_url] = ""
+    if accounts:
+        active = next((account for account in accounts if account["id"] == config["activeAccounts"][ACCOUNT_POOL_KEY]), accounts[0])
+        config.setdefault("cookies", {})[selected_base_url] = active["cookie"]
+    config["baseUrl"] = selected_base_url
+    save_config(config)
+    return account_pool_payload(selected_base_url)
+
+
+def add_current_cookie_to_accounts(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    cookie = str(payload.get("cookie") or "").strip() or payload_cookie(payload, selected_base_url)
+    if not cookie:
+        raise ValueError("当前没有可添加的 Cookie")
+    name = str(payload.get("name") or "").strip() or f"账号 {time.strftime('%H:%M:%S')}"
+    force_new = bool(payload.get("forceNew"))
+    config = load_config()
+    accounts = config.setdefault("accountPools", {}).setdefault(ACCOUNT_POOL_KEY, [])
+    existing = None if force_new else next((account for account in accounts if account.get("cookie") == cookie), None)
+    if existing:
+        existing["name"] = name or existing.get("name") or "账号"
+        existing["enabled"] = True
+        existing["lastCookieRefreshAt"] = time.time()
+        existing["playwrightProfile"] = bool(payload.get("playwrightProfile"))
+        account_id = existing["id"]
+    else:
+        account_id = uuid.uuid4().hex
+        accounts.append(
+            {
+                "id": account_id,
+                "name": name,
+                "cookie": cookie,
+                "enabled": True,
+                "lastRemaining": 0,
+                "lastUsage": 0,
+                "lastLimit": 0,
+                "lastCheckedAt": 0,
+                "lastCookieRefreshAt": time.time(),
+                "playwrightProfile": bool(payload.get("playwrightProfile")),
+                "lastResetInSeconds": None,
+                "lastResetText": "",
+                "lastError": "",
+            }
+        )
+    config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = account_id
+    config.setdefault("cookies", {})[selected_base_url] = cookie
+    config["baseUrl"] = selected_base_url
+    save_config(config)
+    return account_pool_payload(selected_base_url)
+
+
+def select_account(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    account_id = str(payload.get("accountId") or "").strip()
+    config = load_config()
+    accounts = config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    account = next((item for item in accounts if item.get("id") == account_id), None)
+    if not account:
+        raise ValueError("账号不存在")
+    config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = account_id
+    config.setdefault("cookies", {})[selected_base_url] = str(account.get("cookie") or "")
+    config["baseUrl"] = selected_base_url
+    save_config(config)
+    return account_pool_payload(selected_base_url)
+
+
+def delete_account(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    account_id = str(payload.get("accountId") or "").strip()
+    config = load_config()
+    accounts = [
+        account
+        for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+        if account.get("id") != account_id
+    ]
+    config.setdefault("accountPools", {})[ACCOUNT_POOL_KEY] = accounts
+    active_id = str(config.setdefault("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "")
+    if active_id == account_id:
+        config["activeAccounts"][ACCOUNT_POOL_KEY] = accounts[0]["id"] if accounts else ""
+        config.setdefault("cookies", {})[selected_base_url] = accounts[0]["cookie"] if accounts else ""
+    save_config(config)
+    return account_pool_payload(selected_base_url)
+
+
+def toggle_account(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    account_id = str(payload.get("accountId") or "").strip()
+    enabled = bool(payload.get("enabled"))
+    config = load_config()
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        if account.get("id") == account_id:
+            account["enabled"] = enabled
+            save_config(config)
+            return account_pool_payload(selected_base_url)
+    raise ValueError("账号不存在")
+
+
+def rename_account(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    account_id = str(payload.get("accountId") or "").strip()
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise ValueError("账号名称不能为空")
+    config = load_config()
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        if account.get("id") == account_id:
+            account["name"] = name[:60]
+            save_config(config)
+            return account_pool_payload(selected_base_url)
+    raise ValueError("账号不存在")
+
+
+def update_account_cookie(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    account_id = str(payload.get("accountId") or "").strip()
+    cookie = str(payload.get("cookie") or "").strip()
+    if not cookie:
+        raise ValueError("Cookie 不能为空")
+    config = load_config()
+    active_id = str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "")
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        if account.get("id") == account_id:
+            account["cookie"] = cookie
+            account["lastRemaining"] = 0
+            account["lastUsage"] = 0
+            account["lastLimit"] = 0
+            account["lastCheckedAt"] = 0
+            account["lastCookieRefreshAt"] = time.time()
+            account["playwrightProfile"] = bool(payload.get("playwrightProfile"))
+            account["lastResetInSeconds"] = None
+            account["lastResetText"] = ""
+            account["lastError"] = ""
+            if account_id == active_id:
+                config.setdefault("cookies", {})[selected_base_url] = cookie
+            save_config(config)
+            return account_pool_payload(selected_base_url)
+    raise ValueError("账号不存在")
+
+
+def refresh_account_cookie(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    account_id = str(payload.get("accountId") or "").strip()
+    if not account_id:
+        raise ValueError("缺少账号 ID")
+    config = load_config()
+    accounts = config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    account = next((item for item in accounts if item.get("id") == account_id), None)
+    if not account:
+        raise ValueError("账号不存在")
+    try:
+        result = refresh_cookie_with_playwright(selected_base_url)
+    except Exception as exc:
+        account["lastError"] = str(exc)[:200]
+        save_config(config)
+        raise
+    cookie = str(result.get("cookie") or "").strip()
+    if not cookie:
+        raise RuntimeError("没有获取到新的 Cookie，请重新浏览器登录")
+    account["cookie"] = cookie
+    account["lastCookieRefreshAt"] = time.time()
+    account["playwrightProfile"] = True
+    account["lastError"] = ""
+    if str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "") == account_id:
+        config.setdefault("cookies", {})[selected_base_url] = cookie
+    config["baseUrl"] = selected_base_url
+    save_config(config)
+    return account_pool_payload(selected_base_url)
 
 
 def remember_comic(base_url: str, url: str, title: str) -> None:
@@ -325,6 +778,36 @@ def delete_comic_history(base_url: str, comic_id: str) -> dict:
             and str(comic.get("baseUrl") or "").strip().rstrip("/") == selected_base_url
         )
     ]
+    config["followComics"] = [
+        item
+        for item in config.get("followComics", [])
+        if not (
+            str(item.get("comicId") or "").strip() == comic_id
+            and str(item.get("baseUrl") or "").strip().rstrip("/") == selected_base_url
+        )
+    ]
+    save_config(config)
+    return history_payload()
+
+
+def toggle_follow_comic(payload: dict) -> dict:
+    selected_base_url = payload_base_url(payload)
+    comic_id = str(payload.get("comicId") or "").strip()
+    followed = bool(payload.get("followed"))
+    if not comic_id:
+        raise ValueError("缺少漫画 ID")
+    config = load_config()
+    follows = [
+        item
+        for item in config.get("followComics", [])
+        if not (
+            str(item.get("comicId") or "").strip() == comic_id
+            and str(item.get("baseUrl") or "").strip().rstrip("/") == selected_base_url
+        )
+    ]
+    if followed:
+        follows.insert(0, {"baseUrl": selected_base_url, "comicId": comic_id})
+    config["followComics"] = follows[:200]
     save_config(config)
     return history_payload()
 
@@ -400,6 +883,10 @@ def comic_preview_images(title: str) -> list[dict[str, str]]:
 
 def history_payload() -> dict:
     config = load_config()
+    followed_keys = {
+        (str(item.get("baseUrl") or "").rstrip("/"), str(item.get("comicId") or ""))
+        for item in config.get("followComics", [])
+    }
     comics = []
     for comic in config.get("comics") or []:
         title = str(comic.get("title") or "").strip()
@@ -413,20 +900,94 @@ def history_payload() -> dict:
                 "baseUrl": base_url,
                 "comicId": comic_id,
                 "url": f"{base_url}/comic/{comic_id}",
+                "followed": (base_url.rstrip("/"), comic_id) in followed_keys,
                 "previewImages": comic_preview_images(title),
             }
         )
-    return {"comics": comics}
+    downloads = sorted(
+        config.get("downloadHistory") or [],
+        key=lambda item: float(item.get("updatedAt") or item.get("startedAt") or 0),
+        reverse=True,
+    )[:200]
+    return {"comics": comics, "downloads": downloads}
+
+
+def upsert_download_history(entry: dict) -> dict:
+    item = normalize_download_history_item(entry)
+    if not item:
+        raise ValueError("下载历史缺少链接")
+    config = load_config()
+    history = [
+        existing
+        for existing in config.get("downloadHistory", [])
+        if str(existing.get("id") or "") != item["id"]
+    ]
+    history.insert(0, item)
+    config["downloadHistory"] = history[:500]
+    save_config(config)
+    return item
+
+
+def update_download_history(history_id: str, **updates) -> dict | None:
+    if not history_id:
+        return None
+    config = load_config()
+    history = config.get("downloadHistory", [])
+    updated_item = None
+    for item in history:
+        if str(item.get("id") or "") == history_id:
+            item.update(updates)
+            item["updatedAt"] = time.time()
+            if item.get("status") in {"done", "failed", "stopped", "missing", "retried"} and not item.get("finishedAt"):
+                item["finishedAt"] = time.time()
+            updated_item = normalize_download_history_item(item)
+            if updated_item:
+                item.clear()
+                item.update(updated_item)
+            break
+    config["downloadHistory"] = history[:500]
+    save_config(config)
+    return updated_item
+
+
+def create_download_history(
+    *,
+    url: str,
+    base_url: str,
+    task_type: str,
+    title: str = "",
+    status: str = "queued",
+    total: int = 0,
+    downloaded: int = 0,
+    missing: int = 0,
+    message: str = "",
+) -> str:
+    history_id = uuid.uuid4().hex
+    upsert_download_history(
+        {
+            "id": history_id,
+            "type": task_type,
+            "url": url,
+            "title": title or url,
+            "baseUrl": base_url,
+            "status": status,
+            "total": total,
+            "downloaded": downloaded,
+            "missing": missing,
+            "message": message,
+            "startedAt": time.time(),
+            "updatedAt": time.time(),
+        }
+    )
+    return history_id
 
 
 def poll_quota_once(base_url: str = "") -> dict | None:
     config = load_config()
     selected_base_url = normalize_base_url(base_url or str(config.get("baseUrl") or DEFAULT_BASE_URL))
-    cookie = str((config.get("cookies") or {}).get(selected_base_url) or "").strip()
-    if not cookie:
+    limit_info = get_account_pool_limit_info(selected_base_url)
+    if not limit_info:
         return None
-    session = make_session(cookie)
-    limit_info = get_image_limit(session, base_url=selected_base_url)
     return remember_quota(selected_base_url, limit_info)
 
 
@@ -573,11 +1134,13 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     .batch-view,
+    .account-view,
     .history-view {
       grid-template-columns: minmax(0, 1fr);
     }
 
     .batch-panel,
+    .account-panel,
     .quota-panel,
     .history-panel {
       padding: 18px;
@@ -603,10 +1166,23 @@ INDEX_HTML = r"""<!doctype html>
       font-family: "SFMono-Regular", Consolas, monospace;
     }
 
+    .append-links {
+      min-height: 110px;
+      font-family: "SFMono-Regular", Consolas, monospace;
+    }
+
+    .append-field {
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+      margin-top: 2px;
+    }
+
     .batch-results {
       display: grid;
       gap: 8px;
       margin-bottom: 12px;
+      max-height: 318px;
+      overflow: auto;
     }
 
     .batch-result {
@@ -787,6 +1363,33 @@ INDEX_HTML = r"""<!doctype html>
       -webkit-box-orient: vertical;
     }
 
+    .history-title-row {
+      display: grid;
+      grid-template-columns: 30px minmax(0, 1fr);
+      gap: 8px;
+      align-items: start;
+    }
+
+    .follow-star {
+      width: 28px;
+      height: 28px;
+      display: inline-grid;
+      place-items: center;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #ffffff;
+      color: var(--muted);
+      font-size: 17px;
+      line-height: 1;
+      padding: 0;
+    }
+
+    .follow-star.active {
+      color: #a97800;
+      border-color: #e5c15c;
+      background: #fff8dc;
+    }
+
     .history-actions {
       display: flex;
       gap: 8px;
@@ -865,9 +1468,19 @@ INDEX_HTML = r"""<!doctype html>
 
     .input-row {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto;
+      grid-template-columns: minmax(0, 1fr) auto auto;
       gap: 8px;
       align-items: center;
+    }
+
+    .checkbox-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-weight: 500;
+      cursor: pointer;
+      width: fit-content;
     }
 
     .hint {
@@ -1173,6 +1786,96 @@ INDEX_HTML = r"""<!doctype html>
       flex-wrap: wrap;
     }
 
+    .account-pool {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+      margin: -4px 0 14px;
+      overflow: hidden;
+    }
+
+    .account-row {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto;
+      gap: 10px;
+      align-items: center;
+      padding: 9px 10px;
+      border-bottom: 1px solid var(--line);
+      font-size: 13px;
+    }
+
+    .account-row:last-child { border-bottom: 0; }
+
+    .account-row.ok {
+      border-left: 4px solid #5fbf83;
+      background: #f1fbf5;
+    }
+
+    .account-row.problem {
+      border-left: 4px solid #df7a72;
+      background: #fff5f4;
+    }
+
+    .account-name {
+      font-weight: 650;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .account-actions {
+      display: flex;
+      gap: 6px;
+      align-items: center;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }
+
+    .account-actions button {
+      min-height: 30px;
+      padding: 5px 9px;
+      font-size: 12px;
+    }
+
+    .history-section-title {
+      margin: 12px 0 10px;
+      font-size: 14px;
+    }
+
+    .download-history {
+      display: grid;
+      gap: 8px;
+      margin-bottom: 18px;
+    }
+
+    .download-history-row {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fbfcfd;
+      padding: 10px;
+      display: grid;
+      gap: 5px;
+      font-size: 13px;
+    }
+
+    .download-history-row.running {
+      border-color: #9cc7d5;
+      background: #eff8fb;
+    }
+
+    .download-history-row.done,
+    .download-history-row.retried {
+      border-color: #b8dec8;
+      background: #f4fbf7;
+    }
+
+    .download-history-row.failed,
+    .download-history-row.missing,
+    .download-history-row.stopped {
+      border-color: #efb0aa;
+      background: #fff8f7;
+    }
+
     .chapter-tools {
       display: flex;
       gap: 8px;
@@ -1248,7 +1951,8 @@ INDEX_HTML = r"""<!doctype html>
         <div class="nav-tabs">
           <button id="downloadTab" class="active" type="button">下载</button>
           <button id="batchTab" type="button">批量下载</button>
-          <button id="filesTab" type="button">输出文件</button>
+          <button id="accountTab" type="button">账号池</button>
+          <button id="downloadHistoryTab" type="button">下载任务</button>
           <button id="historyTab" type="button">历史记录</button>
           <button id="quotaTab" type="button">额度记录</button>
         </div>
@@ -1273,26 +1977,23 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="field">
             <label for="url">漫画或章节链接</label>
-            <input id="url" name="url" type="text" value="https://komiic.com/comic/1088" required>
+            <input id="url" name="url" type="text" value="" required>
           </div>
           <div class="field">
             <label for="output">输出目录</label>
             <div class="input-row">
-              <input id="output" name="output" type="text" value="downloads">
+              <input id="output" name="output" type="text" value="__DEFAULT_OUTPUT_VALUE__">
               <button id="chooseOutputButton" type="button">选择目录</button>
+              <button id="copyCbzButton" type="button">复制 CBZ</button>
             </div>
+            <label class="checkbox-row">
+              <input id="autoCopyCbz" type="checkbox">
+              <span>下载完成后自动复制新增 CBZ</span>
+            </label>
             <div class="hint">频繁更改输出目录会导致程序读不到旧目录，可能把已下载章节判断为未下载并重复下载。</div>
           </div>
-          <div class="field">
-            <label for="cookie">登录 Cookie</label>
-            <textarea id="cookie" name="cookie" spellcheck="false" placeholder="只粘贴 Cookie 请求头的值，不要粘贴账号密码"></textarea>
-            <div class="cookie-actions">
-              <button id="fetchCookieButton" type="button">浏览器登录获取 Cookie</button>
-              <span id="cookieStatus" class="hint">会打开独立登录窗口，登录后关闭窗口即可保存。</span>
-            </div>
-          </div>
           <div class="quota-inline">
-            <strong id="downloadQuotaText">额度: -</strong>
+            <strong id="downloadQuotaText">账号池额度: -</strong>
             <span id="downloadQuotaCountdown" class="meta">下次刷新: 60 秒</span>
           </div>
           <div class="field">
@@ -1339,18 +2040,52 @@ INDEX_HTML = r"""<!doctype html>
             </div>
             <div class="actions">
               <button id="startBatchButton" class="primary" type="button">开始批量下载</button>
-              <button id="appendBatchButton" type="button" disabled>追加到队列</button>
+              <button id="estimateBatchButton" type="button">获取章节并估算额度</button>
               <button id="stopBatchButton" class="danger" type="button" disabled>停止</button>
+            </div>
+            <label class="checkbox-row">
+              <input id="batchAutoCopyCbz" type="checkbox" checked>
+              <span>批量完成后自动复制新增 CBZ</span>
+            </label>
+            <div class="field append-field">
+              <label for="appendBatchUrls">追加漫画链接（批量运行中可用）</label>
+              <textarea id="appendBatchUrls" class="append-links" spellcheck="false" placeholder="https://komiic.com/comic/1088" disabled></textarea>
+              <div class="actions">
+                <button id="appendBatchButton" type="button" disabled>追加到队列</button>
+              </div>
             </div>
             <div id="batchSummary" class="hint">等待任务...</div>
             <div id="batchResults" class="batch-results"></div>
           </div>
           <section class="log-panel">
             <div class="toolbar">
-              <strong>批量日志</strong>
+              <strong>运行日志</strong>
             </div>
             <pre id="batchLogs">等待任务...</pre>
           </section>
+        </div>
+      </section>
+    </main>
+    <main id="accountView" class="account-view hidden">
+      <section class="account-panel">
+        <div class="toolbar">
+          <strong>账号池</strong>
+        </div>
+        <div class="field">
+          <label for="cookie">登录 Cookie</label>
+          <textarea id="cookie" spellcheck="false" placeholder="只粘贴 Cookie 请求头的值，不要粘贴账号密码"></textarea>
+          <div class="cookie-actions">
+            <button id="fetchCookieButton" type="button">浏览器登录获取 Cookie</button>
+            <button id="addAccountButton" type="button">加入当前 Cookie</button>
+            <span id="cookieStatus" class="hint">会打开独立登录窗口，登录后关闭窗口即可命名并新增账号。</span>
+          </div>
+        </div>
+        <div class="field">
+          <label>账号列表</label>
+          <div id="accountPool" class="account-pool">
+            <div class="account-row"><span class="meta">暂无账号</span></div>
+          </div>
+          <div class="hint">未手动输入 Cookie 时，下载会从当前账号开始；额度用完后自动切换到下一个启用账号。</div>
         </div>
       </section>
     </main>
@@ -1390,7 +2125,7 @@ INDEX_HTML = r"""<!doctype html>
           <div class="quota-card"><span class="meta">剩余额度</span><strong id="quotaRemaining">-</strong></div>
           <div class="quota-card"><span class="meta">已用额度</span><strong id="quotaUsage">-</strong></div>
           <div class="quota-card"><span class="meta">总额度</span><strong id="quotaLimit">-</strong></div>
-          <div class="quota-card"><span class="meta">重置时间</span><strong id="quotaReset">-</strong></div>
+          <div class="quota-card"><span class="meta">最近重置时间</span><strong id="quotaReset">-</strong></div>
         </div>
         <div id="quotaChart" class="quota-chart">
           <div class="empty">暂无额度记录</div>
@@ -1412,12 +2147,31 @@ INDEX_HTML = r"""<!doctype html>
         </table>
       </section>
     </main>
+    <main id="downloadHistoryView" class="history-view hidden">
+      <section class="history-panel">
+        <div class="toolbar">
+          <strong>下载任务</strong>
+          <button id="refreshHistoryButton" type="button">刷新</button>
+        </div>
+        <div id="downloadHistoryList" class="download-history">
+          <div class="meta">暂无下载任务</div>
+        </div>
+      </section>
+    </main>
     <main id="historyView" class="history-view hidden">
       <section class="history-panel">
         <div class="toolbar">
           <strong>历史记录</strong>
-          <button id="refreshHistoryButton" type="button">刷新</button>
+          <div class="chapter-tools">
+            <button id="showFollowButton" type="button">只看追更</button>
+            <select id="historyLimitSelect">
+              <option value="10">最近 10 个</option>
+              <option value="30">最近 30 个</option>
+              <option value="50">最近 50 个</option>
+            </select>
+          </div>
         </div>
+        <h2 class="history-section-title">漫画</h2>
         <div id="historyList" class="history-list">
           <div class="meta">暂无历史记录</div>
         </div>
@@ -1425,14 +2179,18 @@ INDEX_HTML = r"""<!doctype html>
     </main>
   </div>
   <script>
+    const defaultOutputDir = __DEFAULT_OUTPUT_JSON__;
     const form = document.getElementById("downloadForm");
     const downloadTab = document.getElementById("downloadTab");
     const batchTab = document.getElementById("batchTab");
-    const filesTab = document.getElementById("filesTab");
+    const accountTab = document.getElementById("accountTab");
+    const downloadHistoryTab = document.getElementById("downloadHistoryTab");
     const historyTab = document.getElementById("historyTab");
     const quotaTab = document.getElementById("quotaTab");
     const downloadView = document.getElementById("downloadView");
     const batchView = document.getElementById("batchView");
+    const accountView = document.getElementById("accountView");
+    const downloadHistoryView = document.getElementById("downloadHistoryView");
     const filesView = document.getElementById("filesView");
     const historyView = document.getElementById("historyView");
     const quotaView = document.getElementById("quotaView");
@@ -1460,16 +2218,27 @@ INDEX_HTML = r"""<!doctype html>
     const toggleUnchangedQuotaButton = document.getElementById("toggleUnchangedQuotaButton");
     const refreshHistoryButton = document.getElementById("refreshHistoryButton");
     const historyListEl = document.getElementById("historyList");
+    const downloadHistoryListEl = document.getElementById("downloadHistoryList");
+    const historyLimitSelect = document.getElementById("historyLimitSelect");
+    const showFollowButton = document.getElementById("showFollowButton");
     const chooseOutputButton = document.getElementById("chooseOutputButton");
+    const copyCbzButton = document.getElementById("copyCbzButton");
+    const autoCopyCbzEl = document.getElementById("autoCopyCbz");
+    const cookieInputEl = document.getElementById("cookie");
     const fetchCookieButton = document.getElementById("fetchCookieButton");
+    const addAccountButton = document.getElementById("addAccountButton");
     const cookieStatusEl = document.getElementById("cookieStatus");
+    const accountPoolEl = document.getElementById("accountPool");
     const filesSummaryEl = document.getElementById("filesSummary");
     const filesListEl = document.getElementById("filesList");
     const refreshFilesButton = document.getElementById("refreshFilesButton");
     const showAllFilesButton = document.getElementById("showAllFilesButton");
     const showCbzFilesButton = document.getElementById("showCbzFilesButton");
     const batchUrlsEl = document.getElementById("batchUrls");
+    const appendBatchUrlsEl = document.getElementById("appendBatchUrls");
+    const batchAutoCopyCbzEl = document.getElementById("batchAutoCopyCbz");
     const startBatchButton = document.getElementById("startBatchButton");
+    const estimateBatchButton = document.getElementById("estimateBatchButton");
     const appendBatchButton = document.getElementById("appendBatchButton");
     const stopBatchButton = document.getElementById("stopBatchButton");
     const batchSummaryEl = document.getElementById("batchSummary");
@@ -1480,6 +2249,7 @@ INDEX_HTML = r"""<!doctype html>
     let showDownloadedChapters = false;
     let recentComics = [];
     let historyComics = [];
+    let showFollowOnly = false;
     let currentFileTree = null;
     let currentFileSummary = { chapters: 0, cbz: 0 };
     let filesMode = "all";
@@ -1491,6 +2261,9 @@ INDEX_HTML = r"""<!doctype html>
     let quotaCountdown = 60;
     let showUnchangedQuotaRows = false;
     let cookieLoginPollTimer = null;
+    let handledCookieLoginFinishedAt = 0;
+    let cookieLoginStartedInPage = false;
+    let batchEstimateVisible = false;
 
     function selectedBaseUrl() {
       return form.querySelector("input[name='baseUrl']:checked")?.value || "https://komiic.com";
@@ -1513,20 +2286,91 @@ INDEX_HTML = r"""<!doctype html>
       recentComics = Array.isArray(comics) ? comics : [];
     }
 
+    function renderAccounts(accounts) {
+      const rows = Array.isArray(accounts) ? accounts : [];
+      if (!rows.length) {
+        accountPoolEl.innerHTML = "<div class=\"account-row\"><span class=\"meta\">暂无账号，先粘贴或浏览器登录获取 Cookie 后加入账号池。</span></div>";
+        downloadQuotaTextEl.textContent = "账号池额度: 暂无账号";
+        return;
+      }
+      const totals = rows.filter((account) => account.enabled).reduce((sum, account) => {
+        sum.remaining += Number(account.lastRemaining || 0);
+        sum.limit += Number(account.lastLimit || 0);
+        return sum;
+      }, { remaining: 0, limit: 0 });
+      if (totals.limit > 0) {
+        downloadQuotaTextEl.textContent = `账号池额度: 剩余 ${totals.remaining}/${totals.limit}`;
+      }
+      accountPoolEl.innerHTML = rows.map((account) => {
+        const quota = account.lastLimit
+          ? `剩余 ${account.lastRemaining}/${account.lastLimit}`
+          : "尚未查询额度";
+        const reset = account.lastResetText ? `下次重置 ${account.lastResetText}` : "重置时间未知";
+        const active = account.active ? " · 当前" : "";
+        const source = account.playwrightProfile ? " · 浏览器自动刷新" : "";
+        const statusClass = account.lastError || !account.hasCookie
+          ? "problem"
+          : (account.enabled && account.lastLimit ? "ok" : "");
+        const statusText = account.lastError ? ` · ${account.lastError}` : "";
+        return `
+          <div class="account-row ${statusClass}">
+            <div>
+              <div class="account-name">${escapeHtml(account.name || "账号")}${active}</div>
+              <div class="meta">${escapeHtml(quota)} · ${escapeHtml(reset)}${escapeHtml(source)}${escapeHtml(statusText)}</div>
+            </div>
+            <div class="account-actions">
+              <button type="button" data-account-select="${escapeHtml(account.id)}" ${account.active ? "disabled" : ""}>设为当前</button>
+              <button type="button" data-account-rename="${escapeHtml(account.id)}" data-account-name="${escapeHtml(account.name || "账号")}">重命名</button>
+              <button type="button" data-account-refresh="${escapeHtml(account.id)}">刷新 Cookie</button>
+              <button type="button" data-account-cookie="${escapeHtml(account.id)}">更新 Cookie</button>
+              <button type="button" data-account-toggle="${escapeHtml(account.id)}" data-enabled="${account.enabled ? "0" : "1"}">${account.enabled ? "停用" : "启用"}</button>
+              <button class="danger" type="button" data-account-delete="${escapeHtml(account.id)}">删除</button>
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    async function refreshAccounts() {
+      const res = await fetch(`/api/accounts?baseUrl=${encodeURIComponent(selectedBaseUrl())}`);
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "读取账号池失败");
+      }
+      renderAccounts(data.accounts || []);
+      return data;
+    }
+
+    async function postAccountAction(path, body) {
+      const res = await fetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseUrl: selectedBaseUrl(), ...body })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || "账号池操作失败");
+      }
+      renderAccounts(data.accounts || []);
+      await loadConfig(selectedBaseUrl());
+      return data;
+    }
+
     function formPayload() {
       const selectedChapterIds = Array.from(chapterListEl.querySelectorAll("input[type='checkbox']:checked"))
         .map((input) => input.value);
       return {
         baseUrl: selectedBaseUrl(),
         url: form.url.value.trim(),
-        output: form.output.value.trim() || "downloads",
-        cookie: form.cookie.value.trim(),
+        output: form.output.value.trim() || defaultOutputDir,
+        cookie: cookieInputEl.value.trim(),
         maxChapters: 0,
         downloadAll: true,
         selectedChapterIds,
         imageDelay: 1,
         chapterDelay: 1,
-        singleChapter: false
+        singleChapter: false,
+        autoCopyCbz: autoCopyCbzEl.checked
       };
     }
 
@@ -1534,28 +2378,32 @@ INDEX_HTML = r"""<!doctype html>
       activeView = view;
       const downloadActive = view === "download";
       const batchActive = view === "batch";
-      const filesActive = view === "files";
+      const accountActive = view === "account";
+      const downloadHistoryActive = view === "downloadHistory";
       const historyActive = view === "history";
       const quotaActive = view === "quota";
       downloadView.classList.toggle("hidden", !downloadActive);
       batchView.classList.toggle("hidden", !batchActive);
-      filesView.classList.toggle("hidden", !filesActive);
+      accountView.classList.toggle("hidden", !accountActive);
+      downloadHistoryView.classList.toggle("hidden", !downloadHistoryActive);
+      filesView.classList.add("hidden");
       historyView.classList.toggle("hidden", !historyActive);
       quotaView.classList.toggle("hidden", !quotaActive);
       downloadTab.classList.toggle("active", downloadActive);
       batchTab.classList.toggle("active", batchActive);
-      filesTab.classList.toggle("active", filesActive);
+      accountTab.classList.toggle("active", accountActive);
+      downloadHistoryTab.classList.toggle("active", downloadHistoryActive);
       historyTab.classList.toggle("active", historyActive);
       quotaTab.classList.toggle("active", quotaActive);
-      if (filesActive) {
-        loadFiles(lastLoadedOutputDir || form.output.value.trim() || "downloads").catch((error) => {
-          filesSummaryEl.textContent = error.message;
+      if (accountActive) {
+        refreshAccounts().catch((error) => {
+          accountPoolEl.innerHTML = `<div class="account-row"><span class="meta">${escapeHtml(error.message)}</span></div>`;
         });
       }
       if (quotaActive) {
         refreshQuotaHistory(false);
       }
-      if (historyActive) {
+      if (historyActive || downloadHistoryActive) {
         refreshHistory();
       }
     }
@@ -1571,17 +2419,17 @@ INDEX_HTML = r"""<!doctype html>
       quotaLimitEl.textContent = latest ? latest.limit : "-";
       quotaResetEl.textContent = latest ? latest.resetText : "-";
       downloadQuotaTextEl.textContent = latest
-        ? `额度: 剩余 ${latest.remaining}/${latest.limit}，已用 ${latest.usage}`
-        : "额度: 暂无记录";
+        ? `账号池额度: 剩余 ${latest.remaining}/${latest.limit}`
+        : "账号池额度: 暂无记录";
     }
 
     function syncCookieLoginVisibility(cookie) {
-      const hasCookie = Boolean((cookie || form.cookie.value || "").trim());
-      fetchCookieButton.classList.toggle("hidden", hasCookie);
+      const hasCookie = Boolean((cookie || cookieInputEl.value || "").trim());
+      fetchCookieButton.classList.remove("hidden");
       if (hasCookie && !cookieStatusEl.textContent.includes("登录中")) {
         cookieStatusEl.textContent = "Cookie 已保存，额度会自动刷新。";
       } else if (!hasCookie) {
-        cookieStatusEl.textContent = "会打开独立登录窗口，登录后关闭窗口即可保存。";
+        cookieStatusEl.textContent = "会打开独立登录窗口，登录后关闭窗口即可命名并新增账号。";
       }
     }
 
@@ -1592,23 +2440,51 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
-    function applyCookieLoginState(state) {
+    async function applyCookieLoginState(state) {
       if (!state || state.status === "idle") {
         return;
       }
       if (state.status === "running") {
+        cookieLoginStartedInPage = true;
         fetchCookieButton.disabled = true;
         fetchCookieButton.textContent = "登录中...";
-        cookieStatusEl.textContent = "浏览器已打开，登录后关闭窗口即可保存 Cookie。";
+        cookieStatusEl.textContent = "浏览器已打开，登录后关闭窗口即可命名并新增账号。";
         return;
       }
       stopCookieLoginPolling();
       fetchCookieButton.disabled = false;
       fetchCookieButton.textContent = "浏览器登录获取 Cookie";
       if (state.status === "done" && state.cookie) {
-        form.cookie.value = state.cookie;
-        syncCookieLoginVisibility(state.cookie);
-        refreshQuotaHistory(true).catch(() => null);
+        if (!cookieLoginStartedInPage) {
+          return;
+        }
+        const finishedAt = Number(state.finishedAt || Date.now() / 1000);
+        if (finishedAt && finishedAt <= handledCookieLoginFinishedAt) {
+          return;
+        }
+        handledCookieLoginFinishedAt = finishedAt;
+        cookieLoginStartedInPage = false;
+        const defaultName = `Komiic 账号 ${new Date().toLocaleTimeString("zh-CN", { hour12: false })}`;
+        const enteredName = prompt("账号名称", defaultName);
+        const name = (enteredName || defaultName).trim() || defaultName;
+        cookieStatusEl.textContent = "正在新增账号...";
+        try {
+          const data = await postAccountAction("/api/accounts/add-current", {
+            name,
+            cookie: state.cookie,
+            forceNew: true,
+            playwrightProfile: Boolean(state.profileAvailable)
+          });
+          cookieInputEl.value = data.cookie || state.cookie;
+          cookieStatusEl.textContent = `已新增账号「${name}」，并设为当前账号。`;
+          await refreshQuotaHistory(true).catch((error) => {
+            cookieStatusEl.textContent = `已新增账号「${name}」，额度刷新失败: ${error.message}`;
+          });
+          await refreshAccounts().catch(() => null);
+        } catch (error) {
+          cookieStatusEl.textContent = `Cookie 已获取，但新增账号失败: ${error.message}`;
+          syncCookieLoginVisibility(state.cookie);
+        }
         return;
       }
       cookieStatusEl.textContent = state.error || "没有获取到 Cookie。";
@@ -1621,7 +2497,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!res.ok) {
         throw new Error(state.error || "读取登录状态失败");
       }
-      applyCookieLoginState(state);
+      await applyCookieLoginState(state);
       return state;
     }
 
@@ -1651,26 +2527,45 @@ INDEX_HTML = r"""<!doctype html>
         quotaChartEl.innerHTML = "<div class=\"empty\">暂无额度记录</div>";
         return;
       }
-      const points = rows.slice(-80);
+      const buckets = new Map();
+      rows.forEach((record) => {
+        const hour = Math.floor(Number(record.timestamp || 0) / 3600) * 3600;
+        if (!hour) return;
+        buckets.set(hour, { ...record, hour });
+      });
+      const points = Array.from(buckets.values()).sort((left, right) => left.hour - right.hour).slice(-48);
+      if (!points.length) {
+        quotaChartEl.innerHTML = "<div class=\"empty\">暂无可绘制的额度记录</div>";
+        return;
+      }
       const width = 900;
-      const height = 220;
-      const pad = 28;
+      const height = 240;
+      const padLeft = 54;
+      const padRight = 28;
+      const padTop = 28;
+      const padBottom = 46;
       const maxLimit = Math.max(...points.map((record) => Number(record.limit || 0)), 1);
       const xFor = (index) => points.length <= 1
-        ? pad
-        : pad + (index * (width - pad * 2)) / (points.length - 1);
-      const yFor = (remaining) => height - pad - (Number(remaining || 0) / maxLimit) * (height - pad * 2);
+        ? padLeft
+        : padLeft + (index * (width - padLeft - padRight)) / (points.length - 1);
+      const yFor = (remaining) => height - padBottom - (Number(remaining || 0) / maxLimit) * (height - padTop - padBottom);
       const line = points.map((record, index) => `${xFor(index).toFixed(1)},${yFor(record.remaining).toFixed(1)}`).join(" ");
-      const area = `${pad},${height - pad} ${line} ${xFor(points.length - 1).toFixed(1)},${height - pad}`;
+      const baseline = height - padBottom;
+      const area = `${padLeft},${baseline} ${line} ${xFor(points.length - 1).toFixed(1)},${baseline}`;
       const latest = points[points.length - 1];
+      const firstLabel = new Date(points[0].hour * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false });
+      const lastLabel = new Date(latest.hour * 1000).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false });
       quotaChartEl.innerHTML = `
         <svg viewBox="0 0 ${width} ${height}" role="img" aria-label="剩余额度趋势">
-          <line class="axis" x1="${pad}" y1="${height - pad}" x2="${width - pad}" y2="${height - pad}"></line>
-          <line class="axis" x1="${pad}" y1="${pad}" x2="${pad}" y2="${height - pad}"></line>
+          <line class="axis" x1="${padLeft}" y1="${baseline}" x2="${width - padRight}" y2="${baseline}"></line>
+          <line class="axis" x1="${padLeft}" y1="${padTop}" x2="${padLeft}" y2="${baseline}"></line>
           <polygon class="remaining-area" points="${area}"></polygon>
           <polyline class="usage-line" points="${line}"></polyline>
-          <text x="${pad}" y="18" fill="#69707a" font-size="12">剩余 ${escapeHtml(latest.remaining)}/${escapeHtml(latest.limit)}</text>
-          <text x="${width - pad}" y="${height - 8}" text-anchor="end" fill="#69707a" font-size="12">最近 ${points.length} 条记录</text>
+          <text x="${padLeft}" y="18" fill="#69707a" font-size="12">纵轴: 剩余额度（张）</text>
+          <text x="${width - padRight}" y="18" text-anchor="end" fill="#69707a" font-size="12">当前 ${escapeHtml(latest.remaining)}/${escapeHtml(latest.limit)}</text>
+          <text x="${padLeft}" y="${height - 24}" fill="#69707a" font-size="12">${escapeHtml(firstLabel)}</text>
+          <text x="${width - padRight}" y="${height - 24}" text-anchor="end" fill="#69707a" font-size="12">${escapeHtml(lastLabel)}</text>
+          <text x="${width / 2}" y="${height - 6}" text-anchor="middle" fill="#69707a" font-size="12">横轴: 时间（每小时一个点）</text>
         </svg>
       `;
     }
@@ -1683,12 +2578,13 @@ INDEX_HTML = r"""<!doctype html>
         await fetch("/api/quota/poll", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ baseUrl: selectedBaseUrl(), cookie: form.cookie.value.trim() })
+          body: JSON.stringify({ baseUrl: selectedBaseUrl(), cookie: cookieInputEl.value.trim() })
         }).catch(() => null);
       }
       const data = await refreshQuotaHistoryData();
       const latest = data.latest;
       renderQuotaLatest(latest);
+      refreshAccounts().catch(() => null);
       const rows = data.history || [];
       if (!rows.length) {
         renderQuotaChart([]);
@@ -1725,8 +2621,9 @@ INDEX_HTML = r"""<!doctype html>
       }
       setBaseUrl(data.baseUrl);
       syncUrlHost(data.baseUrl);
-      form.cookie.value = data.cookie || "";
+      cookieInputEl.value = data.cookie || "";
       syncCookieLoginVisibility(data.cookie || "");
+      renderAccounts(data.accounts || []);
       populateRecentComics(data.comics || []);
       return data;
     }
@@ -1799,8 +2696,8 @@ INDEX_HTML = r"""<!doctype html>
           body: JSON.stringify({
             baseUrl: selectedBaseUrl(),
             url: form.url.value.trim(),
-            output: form.output.value.trim() || "downloads",
-            cookie: form.cookie.value.trim()
+            output: form.output.value.trim() || defaultOutputDir,
+            cookie: cookieInputEl.value.trim()
           })
         });
         const data = await res.json();
@@ -1833,11 +2730,16 @@ INDEX_HTML = r"""<!doctype html>
 
     function renderHistory(comics) {
       historyComics = Array.isArray(comics) ? comics : [];
-      if (!historyComics.length) {
+      const limit = Number(historyLimitSelect.value || 10);
+      const visibleComics = historyComics
+        .filter((comic) => !showFollowOnly || comic.followed)
+        .slice(0, limit);
+      if (!visibleComics.length) {
         historyListEl.innerHTML = "<div class=\"meta\">暂无历史记录</div>";
         return;
       }
-      historyListEl.innerHTML = historyComics.map((comic, index) => {
+      historyListEl.innerHTML = visibleComics.map((comic) => {
+        const index = historyComics.indexOf(comic);
         const previews = (comic.previewImages || []).slice(0, 3);
         const thumbs = [0, 1, 2].map((slot) => {
           const image = previews[slot];
@@ -1850,10 +2752,14 @@ INDEX_HTML = r"""<!doctype html>
           <article class="history-card">
             <div class="history-preview">${thumbs}</div>
             <div class="history-body">
-              <div class="history-title">${escapeHtml(comic.title || comic.comicId)}</div>
+              <div class="history-title-row">
+                <button class="follow-star ${comic.followed ? "active" : ""}" type="button" data-follow-history-index="${index}" title="追更">★</button>
+                <div class="history-title">${escapeHtml(comic.title || comic.comicId)}</div>
+              </div>
               <div class="meta">${escapeHtml(comic.baseUrl || "")}</div>
               <div class="history-actions">
-                <button type="button" data-history-index="${index}">选择并获取章节</button>
+                <button type="button" data-history-index="${index}">获取</button>
+                <button type="button" data-download-history-index="${index}">下载</button>
                 <button class="danger" type="button" data-delete-history-index="${index}">删除</button>
               </div>
             </div>
@@ -1865,11 +2771,86 @@ INDEX_HTML = r"""<!doctype html>
           selectComicAndFetch(historyComics[Number(button.dataset.historyIndex)]);
         });
       });
+      historyListEl.querySelectorAll("button[data-download-history-index]").forEach((button) => {
+        button.addEventListener("click", () => {
+          startHistoryDownload(historyComics[Number(button.dataset.downloadHistoryIndex)]);
+        });
+      });
+      historyListEl.querySelectorAll("button[data-follow-history-index]").forEach((button) => {
+        button.addEventListener("click", () => {
+          toggleFollowComic(historyComics[Number(button.dataset.followHistoryIndex)]);
+        });
+      });
       historyListEl.querySelectorAll("button[data-delete-history-index]").forEach((button) => {
         button.addEventListener("click", () => {
           deleteHistoryComic(historyComics[Number(button.dataset.deleteHistoryIndex)]);
         });
       });
+    }
+
+    async function startHistoryDownload(comic) {
+      if (!comic) return;
+      selectComic(comic);
+      switchView("download");
+      const res = await fetch("/api/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(formPayload())
+      });
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({ error: "启动失败" }));
+        alert(data.error || "启动失败");
+      }
+      await refreshState();
+    }
+
+    async function toggleFollowComic(comic) {
+      if (!comic) return;
+      const res = await fetch("/api/history/follow", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ baseUrl: comic.baseUrl, comicId: comic.comicId, followed: !comic.followed })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        alert(data.error || "更新追更失败");
+        return;
+      }
+      renderHistory(data.comics || []);
+    }
+
+    function downloadStatusText(status) {
+      return {
+        queued: "等待中",
+        running: "下载中",
+        done: "完成",
+        failed: "失败",
+        stopped: "已停止",
+        retried: "重试完成",
+        missing: "仍缺章节"
+      }[status] || status;
+    }
+
+    function renderDownloadHistory(downloads) {
+      const rows = Array.isArray(downloads) ? downloads : [];
+      if (!rows.length) {
+        downloadHistoryListEl.innerHTML = "<div class=\"meta\">暂无下载任务</div>";
+        return;
+      }
+      downloadHistoryListEl.innerHTML = rows.map((item) => {
+        const progress = item.total
+          ? `${item.downloaded || 0}/${item.total} 章`
+          : `${item.downloaded || 0} 章`;
+        const missing = item.missing ? `，缺 ${item.missing} 章` : "";
+        return `
+          <div class="download-history-row ${escapeHtml(item.status || "")}">
+            <strong>${escapeHtml(item.title || item.url)}</strong>
+            <div class="meta">${escapeHtml(downloadStatusText(item.status))} · ${escapeHtml(item.type === "batch" ? "批量" : "单个")} · ${escapeHtml(progress)}${escapeHtml(missing)}</div>
+            <div class="meta">${escapeHtml(item.message || "")}</div>
+            <div class="meta">${escapeHtml(formatTime(item.updatedAt || item.startedAt))} · ${escapeHtml(item.url || "")}</div>
+          </div>
+        `;
+      }).join("");
     }
 
     async function refreshHistory() {
@@ -1878,6 +2859,7 @@ INDEX_HTML = r"""<!doctype html>
       if (!res.ok) {
         throw new Error(data.error || "读取历史记录失败");
       }
+      renderDownloadHistory(data.downloads || []);
       renderHistory(data.comics || []);
     }
 
@@ -1979,7 +2961,7 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     async function loadFiles(outputDir = "") {
-      const output = outputDir || form.output.value.trim() || "downloads";
+      const output = outputDir || form.output.value.trim() || defaultOutputDir;
       refreshFilesButton.disabled = true;
       try {
         const res = await fetch(`/api/files?output=${encodeURIComponent(output)}`);
@@ -2000,7 +2982,7 @@ INDEX_HTML = r"""<!doctype html>
       const res = await fetch("/api/choose-directory", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ path: form.output.value.trim() || "downloads" })
+        body: JSON.stringify({ path: form.output.value.trim() || defaultOutputDir })
       });
       const data = await res.json();
       if (!res.ok) {
@@ -2025,15 +3007,26 @@ INDEX_HTML = r"""<!doctype html>
       }[status] || status;
     }
 
-    function batchPayload() {
+    function batchPayload(urls = batchUrlsEl.value) {
       return {
         baseUrl: selectedBaseUrl(),
-        urls: batchUrlsEl.value,
-        output: form.output.value.trim() || "downloads",
-        cookie: form.cookie.value.trim(),
+        urls,
+        output: form.output.value.trim() || defaultOutputDir,
+        cookie: cookieInputEl.value.trim(),
         imageDelay: 1,
-        chapterDelay: 1
+        chapterDelay: 1,
+        autoCopyCbz: batchAutoCopyCbzEl.checked
       };
+    }
+
+    function setSharedLogs(lines) {
+      const text = Array.isArray(lines) && lines.length ? lines.join("\n") : "等待任务...";
+      logsEl.textContent = text;
+      logsEl.scrollTop = logsEl.scrollHeight;
+      if (batchLogsEl) {
+        batchLogsEl.textContent = text;
+        batchLogsEl.scrollTop = batchLogsEl.scrollHeight;
+      }
     }
 
     function renderBatchResults(results) {
@@ -2057,17 +3050,25 @@ INDEX_HTML = r"""<!doctype html>
     }
 
     function setBatchState(state) {
+      if (state.running) {
+        batchEstimateVisible = false;
+      }
       batchRunning = state.running;
       const total = (state.urls || []).length;
       const current = state.currentIndex >= 0 ? state.currentIndex + 1 : 0;
-      batchSummaryEl.textContent = state.running
-        ? `正在处理 ${current}/${total}`
-        : `状态: ${batchStatusText(state.status)}${total ? `，共 ${total} 个链接` : ""}`;
-      batchCommandEl.textContent = state.outputDir ? `输出目录: ${state.outputDir}` : "";
-      batchLogsEl.textContent = state.logs && state.logs.length ? state.logs.join("\n") : "等待任务...";
-      batchLogsEl.scrollTop = batchLogsEl.scrollHeight;
-      renderBatchResults(state.results || []);
+      if (!batchEstimateVisible || state.running) {
+        batchSummaryEl.textContent = state.running
+          ? `正在处理 ${current}/${total}`
+          : `状态: ${batchStatusText(state.status)}${total ? `，共 ${total} 个链接` : ""}`;
+        batchCommandEl.textContent = state.outputDir ? `输出目录: ${state.outputDir}` : "";
+        if (activeView === "batch" || state.running) {
+          setSharedLogs(state.logs || []);
+        }
+        renderBatchResults(state.results || []);
+      }
       startBatchButton.disabled = state.running || statusEl.classList.contains("running");
+      estimateBatchButton.disabled = state.running || statusEl.classList.contains("running");
+      appendBatchUrlsEl.disabled = !state.running;
       appendBatchButton.disabled = !state.running;
       stopBatchButton.disabled = !state.running;
       startButton.disabled = batchRunning || statusEl.classList.contains("running");
@@ -2086,6 +3087,31 @@ INDEX_HTML = r"""<!doctype html>
         throw new Error(state.error || "读取批量状态失败");
       }
       setBatchState(state);
+    }
+
+    function renderBatchEstimate(data) {
+      batchEstimateVisible = true;
+      const totalPages = Number(data.totalPages || 0);
+      const missingChapters = Number(data.missingChapters || 0);
+      batchSummaryEl.textContent = `预计消耗 ${totalPages} 图片额度，需下载 ${missingChapters} 个章节，共 ${Number(data.totalComics || 0)} 个漫画`;
+      const results = Array.isArray(data.results) ? data.results : [];
+      if (!results.length) {
+        batchResultsEl.innerHTML = "<div class=\"batch-result\"><strong>没有可估算的漫画</strong><div class=\"meta\">请先在上方输入漫画链接。</div></div>";
+        return;
+      }
+      batchResultsEl.innerHTML = results.map((result, index) => {
+        const status = result.error ? "failed" : (result.missingChapters ? "running" : "done");
+        const detail = result.error
+          ? result.error
+          : `未下载章节 ${result.missingChapters}/${result.totalChapters}，预计 ${result.pages} 图片额度`;
+        return `
+          <div class="batch-result ${escapeHtml(status)}">
+            <strong>${index + 1}. ${escapeHtml(result.title || result.url)}</strong>
+            <div class="meta">${escapeHtml(result.url || "")}</div>
+            <div class="meta">${escapeHtml(detail)}</div>
+          </div>
+        `;
+      }).join("");
     }
 
     function renderChapters(chapters) {
@@ -2140,8 +3166,9 @@ INDEX_HTML = r"""<!doctype html>
       const state = await res.json();
       setStatus(state);
       commandEl.textContent = state.command.length ? state.command.join(" ") : "";
-      logsEl.textContent = state.logs.length ? state.logs.join("\n") : "等待任务...";
-      logsEl.scrollTop = logsEl.scrollHeight;
+      if (!batchRunning) {
+        setSharedLogs(state.logs || []);
+      }
       if (state.running && !lastObservedRunning) {
         clearFiles("任务运行中");
       }
@@ -2149,6 +3176,9 @@ INDEX_HTML = r"""<!doctype html>
         loadFiles(state.outputDir).catch((error) => {
           filesSummaryEl.textContent = error.message;
         });
+      }
+      if (activeView === "history" || activeView === "downloadHistory") {
+        refreshHistory().catch(() => null);
       }
       lastObservedRunning = state.running;
     }
@@ -2192,8 +3222,100 @@ INDEX_HTML = r"""<!doctype html>
       syncChapterLimit();
     });
 
+    addAccountButton.addEventListener("click", async () => {
+      addAccountButton.disabled = true;
+      try {
+        const name = prompt("账号名称", "Komiic 账号");
+        if (name === null) {
+          return;
+        }
+        await postAccountAction("/api/accounts/add-current", { name, cookie: cookieInputEl.value.trim() });
+        cookieStatusEl.textContent = "已加入账号池，并设为当前账号。";
+        await refreshQuotaHistory(true).catch((error) => {
+          cookieStatusEl.textContent = `已加入账号池，额度刷新失败: ${error.message}`;
+        });
+        await refreshAccounts().catch(() => null);
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        addAccountButton.disabled = false;
+      }
+    });
+
+    accountPoolEl.addEventListener("click", async (event) => {
+      const selectButton = event.target.closest("button[data-account-select]");
+      const renameButton = event.target.closest("button[data-account-rename]");
+      const refreshCookieButton = event.target.closest("button[data-account-refresh]");
+      const cookieButton = event.target.closest("button[data-account-cookie]");
+      const toggleButton = event.target.closest("button[data-account-toggle]");
+      const deleteButton = event.target.closest("button[data-account-delete]");
+      try {
+        if (selectButton) {
+          await postAccountAction("/api/accounts/select", { accountId: selectButton.dataset.accountSelect });
+          await refreshQuotaHistory(false);
+          return;
+        }
+        if (renameButton) {
+          const currentName = renameButton.dataset.accountName || "账号";
+          const name = prompt("账号名称", currentName);
+          if (name === null) {
+            return;
+          }
+          await postAccountAction("/api/accounts/rename", {
+            accountId: renameButton.dataset.accountRename,
+            name
+          });
+          return;
+        }
+        if (refreshCookieButton) {
+          const previousText = refreshCookieButton.textContent;
+          refreshCookieButton.disabled = true;
+          refreshCookieButton.textContent = "刷新中...";
+          try {
+            await postAccountAction("/api/accounts/refresh-cookie", {
+              accountId: refreshCookieButton.dataset.accountRefresh
+            });
+            await refreshQuotaHistory(true).catch(() => null);
+          } finally {
+            refreshCookieButton.disabled = false;
+            refreshCookieButton.textContent = previousText;
+          }
+          return;
+        }
+        if (cookieButton) {
+          const cookie = prompt("粘贴新的 Cookie");
+          if (cookie === null) {
+            return;
+          }
+          await postAccountAction("/api/accounts/update-cookie", {
+            accountId: cookieButton.dataset.accountCookie,
+            cookie
+          });
+          await refreshQuotaHistory(true).catch(() => null);
+          return;
+        }
+        if (toggleButton) {
+          await postAccountAction("/api/accounts/toggle", {
+            accountId: toggleButton.dataset.accountToggle,
+            enabled: toggleButton.dataset.enabled === "1"
+          });
+          return;
+        }
+        if (deleteButton) {
+          if (!confirm("删除这个账号？只会移除保存的 Cookie，不会影响已下载文件。")) {
+            return;
+          }
+          await postAccountAction("/api/accounts/delete", { accountId: deleteButton.dataset.accountDelete });
+          await refreshQuotaHistory(false);
+        }
+      } catch (error) {
+        alert(error.message);
+      }
+    });
+
     fetchCookieButton.addEventListener("click", async () => {
       fetchCookieButton.disabled = true;
+      cookieLoginStartedInPage = true;
       const previousText = fetchCookieButton.textContent;
       fetchCookieButton.textContent = "启动中...";
       cookieStatusEl.textContent = "正在打开登录窗口。";
@@ -2207,7 +3329,7 @@ INDEX_HTML = r"""<!doctype html>
         if (!res.ok) {
           throw new Error(data.error || "获取 Cookie 失败");
         }
-        applyCookieLoginState(data);
+        await applyCookieLoginState(data);
         startCookieLoginPolling();
       } catch (error) {
         cookieStatusEl.textContent = error.message;
@@ -2227,8 +3349,12 @@ INDEX_HTML = r"""<!doctype html>
       });
     });
 
-    filesTab.addEventListener("click", () => {
-      switchView("files");
+    accountTab.addEventListener("click", () => {
+      switchView("account");
+    });
+
+    downloadHistoryTab.addEventListener("click", () => {
+      switchView("downloadHistory");
     });
 
     historyTab.addEventListener("click", () => {
@@ -2250,6 +3376,17 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
 
+    historyLimitSelect.addEventListener("change", () => {
+      renderHistory(historyComics);
+    });
+
+    showFollowButton.addEventListener("click", () => {
+      showFollowOnly = !showFollowOnly;
+      showFollowButton.classList.toggle("active", showFollowOnly);
+      showFollowButton.textContent = showFollowOnly ? "显示全部" : "只看追更";
+      renderHistory(historyComics);
+    });
+
     chooseOutputButton.addEventListener("click", async () => {
       chooseOutputButton.disabled = true;
       try {
@@ -2263,7 +3400,31 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
 
+    copyCbzButton.addEventListener("click", async () => {
+      copyCbzButton.disabled = true;
+      const previousText = copyCbzButton.textContent;
+      copyCbzButton.textContent = "复制中...";
+      try {
+        const res = await fetch("/api/files/copy-cbz", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ output: form.output.value.trim() || defaultOutputDir })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || "复制失败");
+        }
+        alert(`已复制 ${data.copied || 0} 个 CBZ 到 ${data.target || ""}`);
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        copyCbzButton.textContent = previousText;
+        copyCbzButton.disabled = false;
+      }
+    });
+
     startBatchButton.addEventListener("click", async () => {
+      batchEstimateVisible = false;
       startBatchButton.disabled = true;
       try {
         const res = await fetch("/api/batch/start", {
@@ -2283,24 +3444,57 @@ INDEX_HTML = r"""<!doctype html>
       }
     });
 
-    stopBatchButton.addEventListener("click", async () => {
-      await fetch("/api/batch/stop", { method: "POST" });
-      await refreshBatchState().catch(() => null);
-    });
-
-    appendBatchButton.addEventListener("click", async () => {
-      appendBatchButton.disabled = true;
+    estimateBatchButton.addEventListener("click", async () => {
+      if (!batchUrlsEl.value.trim()) {
+        batchSummaryEl.textContent = "请先输入至少一个漫画链接。";
+        batchResultsEl.innerHTML = "<div class=\"batch-result failed\"><strong>没有链接</strong><div class=\"meta\">每行输入一个漫画链接后再估算。</div></div>";
+        batchUrlsEl.focus();
+        return;
+      }
+      estimateBatchButton.disabled = true;
+      const previousText = estimateBatchButton.textContent;
+      estimateBatchButton.textContent = "获取中...";
+      batchSummaryEl.textContent = "正在获取章节并检查本地输出目录...";
+      batchResultsEl.innerHTML = "<div class=\"batch-result\"><strong>正在估算...</strong><div class=\"meta\">正在读取章节和本地下载状态。</div></div>";
       try {
-        const res = await fetch("/api/batch/append", {
+        const res = await fetch("/api/batch/estimate", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(batchPayload())
         });
         const data = await res.json();
         if (!res.ok) {
+          throw new Error(data.error || "估算失败");
+        }
+        renderBatchEstimate(data);
+      } catch (error) {
+        batchSummaryEl.textContent = error.message;
+        batchResultsEl.innerHTML = `<div class="batch-result failed"><strong>估算失败</strong><div class="meta">${escapeHtml(error.message)}</div></div>`;
+      } finally {
+        estimateBatchButton.textContent = previousText;
+        estimateBatchButton.disabled = batchRunning || statusEl.classList.contains("running");
+      }
+    });
+
+    stopBatchButton.addEventListener("click", async () => {
+      await fetch("/api/batch/stop", { method: "POST" });
+      await refreshBatchState().catch(() => null);
+    });
+
+    appendBatchButton.addEventListener("click", async () => {
+      batchEstimateVisible = false;
+      appendBatchButton.disabled = true;
+      try {
+        const res = await fetch("/api/batch/append", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(batchPayload(appendBatchUrlsEl.value))
+        });
+        const data = await res.json();
+        if (!res.ok) {
           throw new Error(data.error || "追加失败");
         }
-        batchUrlsEl.value = "";
+        appendBatchUrlsEl.value = "";
         setBatchState(data);
       } catch (error) {
         alert(error.message);
@@ -2311,7 +3505,7 @@ INDEX_HTML = r"""<!doctype html>
 
     refreshFilesButton.addEventListener("click", async () => {
       try {
-        await loadFiles(lastLoadedOutputDir || form.output.value.trim() || "downloads");
+        await loadFiles(lastLoadedOutputDir || form.output.value.trim() || defaultOutputDir);
       } catch (error) {
         alert(error.message);
       }
@@ -2500,65 +3694,121 @@ def cookie_header_from_playwright_cookies(cookies: list[dict], base_url: str) ->
     return "; ".join(pairs)
 
 
-def fetch_cookie_with_playwright(base_url: str) -> dict[str, str | int]:
-    selected_base_url = normalize_base_url(base_url or DEFAULT_BASE_URL)
+def import_playwright():
     try:
         from playwright.sync_api import Error as PlaywrightError
+        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
         from playwright.sync_api import sync_playwright
     except ModuleNotFoundError as exc:
         raise RuntimeError("缺少 Playwright，请先安装依赖: pip install -r requirements.txt") from exc
+    return sync_playwright, PlaywrightError, PlaywrightTimeoutError
 
-    PLAYWRIGHT_PROFILE_DIR.mkdir(parents=True, exist_ok=True)
+
+def launch_persistent_playwright_context(playwright, profile_dir: Path, *, headless: bool, timeout: int):
+    _, PlaywrightError, _ = import_playwright()
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    launch_options = {
+        "headless": headless,
+        "args": ["--disable-blink-features=AutomationControlled"],
+    }
+    try:
+        return playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            channel="chrome",
+            timeout=timeout,
+            **launch_options,
+        )
+    except PlaywrightError:
+        return playwright.chromium.launch_persistent_context(
+            str(profile_dir),
+            timeout=timeout,
+            **launch_options,
+        )
+
+
+def read_playwright_cookie_header(context, base_url: str) -> tuple[str, int]:
+    cookies = context.cookies([base_url])
+    return cookie_header_from_playwright_cookies(cookies, base_url), len(cookies)
+
+
+def fetch_cookie_with_playwright(base_url: str) -> dict[str, str | int | bool]:
+    selected_base_url = normalize_base_url(base_url or DEFAULT_BASE_URL)
+    sync_playwright, PlaywrightError, _ = import_playwright()
+
     latest_cookie = ""
     cookie_count = 0
-    with sync_playwright() as playwright:
-        launch_options = {
-            "headless": False,
-            "args": ["--disable-blink-features=AutomationControlled"],
-        }
-        try:
-            context = playwright.chromium.launch_persistent_context(
-                str(PLAYWRIGHT_PROFILE_DIR),
-                channel="chrome",
-                **launch_options,
+    with COOKIE_REFRESH_LOCK:
+        with sync_playwright() as playwright:
+            context = launch_persistent_playwright_context(
+                playwright,
+                PLAYWRIGHT_PROFILE_DIR,
+                headless=False,
+                timeout=20000,
             )
-        except PlaywrightError:
-            context = playwright.chromium.launch_persistent_context(
-                str(PLAYWRIGHT_PROFILE_DIR),
-                **launch_options,
-            )
-        try:
-            page = context.pages[0] if context.pages else context.new_page()
-            page.goto(selected_base_url, wait_until="domcontentloaded", timeout=60000)
-            deadline = time.time() + 180
-            while time.time() < deadline:
-                try:
-                    cookies = context.cookies([selected_base_url])
-                    cookie_count = len(cookies)
-                    header = cookie_header_from_playwright_cookies(cookies, selected_base_url)
-                    if header:
-                        latest_cookie = header
-                    if not context.pages:
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(selected_base_url, wait_until="domcontentloaded", timeout=60000)
+                deadline = time.time() + 180
+                while time.time() < deadline:
+                    try:
+                        header, cookie_count = read_playwright_cookie_header(context, selected_base_url)
+                        if header:
+                            latest_cookie = header
+                        if not context.pages:
+                            break
+                    except PlaywrightError:
                         break
+                    time.sleep(1)
+            finally:
+                try:
+                    header, cookie_count = read_playwright_cookie_header(context, selected_base_url)
+                    latest_cookie = header or latest_cookie
                 except PlaywrightError:
-                    break
-                time.sleep(1)
-        finally:
-            try:
-                cookies = context.cookies([selected_base_url])
-                cookie_count = len(cookies)
-                latest_cookie = cookie_header_from_playwright_cookies(cookies, selected_base_url) or latest_cookie
-            except PlaywrightError:
-                pass
-            try:
-                context.close()
-            except PlaywrightError:
-                pass
+                    pass
+                try:
+                    context.close()
+                except PlaywrightError:
+                    pass
 
     if not latest_cookie:
         raise RuntimeError("没有获取到 Cookie，请登录完成后关闭浏览器窗口再试")
-    remember_cookie(selected_base_url, latest_cookie)
-    return {"cookie": latest_cookie, "cookieCount": cookie_count}
+    return {"cookie": latest_cookie, "cookieCount": cookie_count, "profileAvailable": True}
+
+
+def refresh_cookie_with_playwright(base_url: str) -> dict[str, str | int]:
+    selected_base_url = normalize_base_url(base_url or DEFAULT_BASE_URL)
+    sync_playwright, PlaywrightError, PlaywrightTimeoutError = import_playwright()
+    if not PLAYWRIGHT_PROFILE_DIR.exists():
+        raise RuntimeError("还没有浏览器登录资料，请先用浏览器登录获取 Cookie")
+    if not COOKIE_REFRESH_LOCK.acquire(blocking=False):
+        raise RuntimeError("Cookie 正在刷新中")
+    try:
+        with sync_playwright() as playwright:
+            context = launch_persistent_playwright_context(
+                playwright,
+                PLAYWRIGHT_PROFILE_DIR,
+                headless=True,
+                timeout=20000,
+            )
+            try:
+                page = context.pages[0] if context.pages else context.new_page()
+                page.goto(selected_base_url, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except PlaywrightTimeoutError:
+                    pass
+                page.wait_for_timeout(1500)
+                header, cookie_count = read_playwright_cookie_header(context, selected_base_url)
+            finally:
+                try:
+                    context.close()
+                except PlaywrightError:
+                    pass
+    finally:
+        COOKIE_REFRESH_LOCK.release()
+    if not header:
+        raise RuntimeError("浏览器资料中没有可用 Cookie，请重新登录")
+    return {"cookie": header, "cookieCount": cookie_count}
 
 
 def cookie_login_worker(base_url: str) -> None:
@@ -2570,6 +3820,7 @@ def cookie_login_worker(base_url: str) -> None:
             COOKIE_LOGIN.finished_at = time.time()
             COOKIE_LOGIN.cookie = str(result.get("cookie") or "")
             COOKIE_LOGIN.cookie_count = int(result.get("cookieCount") or 0)
+            COOKIE_LOGIN.profile_available = bool(result.get("profileAvailable"))
             COOKIE_LOGIN.error = ""
     except Exception as exc:
         with COOKIE_LOGIN.lock:
@@ -2582,6 +3833,12 @@ def cookie_login_worker(base_url: str) -> None:
 def start_cookie_login(base_url: str) -> dict:
     selected_base_url = normalize_base_url(base_url or DEFAULT_BASE_URL)
     with COOKIE_LOGIN.lock:
+        stale = COOKIE_LOGIN.running and COOKIE_LOGIN.started_at and time.time() - COOKIE_LOGIN.started_at > 240
+        if stale:
+            COOKIE_LOGIN.running = False
+            COOKIE_LOGIN.status = "failed"
+            COOKIE_LOGIN.finished_at = time.time()
+            COOKIE_LOGIN.error = "上一次浏览器登录已超时，请重新点击"
         if COOKIE_LOGIN.running:
             already_running = True
         else:
@@ -2593,6 +3850,7 @@ def start_cookie_login(base_url: str) -> dict:
             COOKIE_LOGIN.base_url = selected_base_url
             COOKIE_LOGIN.cookie = ""
             COOKIE_LOGIN.cookie_count = 0
+            COOKIE_LOGIN.profile_available = False
             COOKIE_LOGIN.error = ""
     if already_running:
         return COOKIE_LOGIN.snapshot()
@@ -2607,6 +3865,276 @@ def payload_base_url(payload: dict) -> str:
 def payload_cookie(payload: dict, base_url: str) -> str:
     cookie = str(payload.get("cookie") or "").strip()
     return cookie or saved_cookie(base_url)
+
+
+def refresh_playwright_account_cookie(
+    base_url: str,
+    account_id: str = "",
+    *,
+    force: bool = False,
+    log_func=None,
+) -> dict | None:
+    selected_base_url = normalize_base_url(base_url)
+    config = load_config()
+    accounts = config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    selected_id = str(account_id or config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "").strip()
+    account = next((item for item in accounts if str(item.get("id") or "") == selected_id), None)
+    if not account or not account.get("enabled", True) or not account.get("playwrightProfile"):
+        return account
+    with COOKIE_LOGIN.lock:
+        if COOKIE_LOGIN.running:
+            return account
+    now = time.time()
+    if not force and now - float(account.get("lastCookieRefreshAt") or 0) < COOKIE_REFRESH_MIN_INTERVAL:
+        return account
+    if log_func:
+        log_func(f"正在刷新账号「{account.get('name') or '账号'}」的 Cookie。")
+    try:
+        result = refresh_cookie_with_playwright(selected_base_url)
+    except Exception as exc:
+        account["lastError"] = str(exc)[:200]
+        save_config(config)
+        if log_func:
+            log_func(f"Cookie 刷新失败，继续使用已保存 Cookie: {exc}")
+        return account
+    refreshed_cookie = str(result.get("cookie") or "").strip()
+    if not refreshed_cookie:
+        return account
+    account["cookie"] = refreshed_cookie
+    account["lastCookieRefreshAt"] = time.time()
+    account["lastError"] = ""
+    if str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "") == str(account.get("id") or ""):
+        config.setdefault("cookies", {})[selected_base_url] = refreshed_cookie
+    save_config(config)
+    if log_func:
+        log_func(f"账号「{account.get('name') or '账号'}」Cookie 已刷新。")
+    return account
+
+
+def payload_cookie_with_refresh(payload: dict, base_url: str, log_func=None) -> str:
+    manual_cookie = str(payload.get("cookie") or "").strip()
+    if manual_cookie:
+        return manual_cookie
+    account = refresh_playwright_account_cookie(base_url, log_func=log_func)
+    return str((account or {}).get("cookie") or saved_cookie(base_url))
+
+
+def cookie_matches_account(cookie: str, accounts: list[dict]) -> bool:
+    cookie = cookie.strip()
+    return bool(cookie) and any(str(account.get("cookie") or "").strip() == cookie for account in accounts)
+
+
+def payload_has_manual_cookie(payload: dict) -> bool:
+    cookie = str(payload.get("cookie") or "").strip()
+    if not cookie:
+        return False
+    accounts = load_config().get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    return not cookie_matches_account(cookie, accounts)
+
+
+def account_candidates(payload: dict, base_url: str) -> list[dict]:
+    manual_cookie = str(payload.get("cookie") or "").strip()
+    config = load_config()
+    selected_base_url = normalize_base_url(base_url)
+    accounts = [
+        account
+        for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+        if account.get("enabled", True) and str(account.get("cookie") or "").strip()
+    ]
+    if manual_cookie and not cookie_matches_account(manual_cookie, accounts):
+        return [{"id": "manual", "name": "输入框 Cookie", "cookie": manual_cookie}]
+    active_id = str(config.get("activeAccounts", {}).get(ACCOUNT_POOL_KEY) or "")
+    if active_id:
+        active_index = next((index for index, account in enumerate(accounts) if account.get("id") == active_id), 0)
+        accounts = accounts[active_index:] + accounts[:active_index]
+    if accounts:
+        return [
+            {
+                "id": str(account.get("id") or ""),
+                "name": str(account.get("name") or "账号"),
+                "cookie": str(account.get("cookie") or ""),
+                "playwrightProfile": bool(account.get("playwrightProfile")),
+            }
+            for account in accounts
+        ]
+    cookie = saved_cookie(selected_base_url)
+    return [{"id": "saved", "name": "保存的 Cookie", "cookie": cookie}] if cookie else [{"id": "", "name": "无 Cookie", "cookie": ""}]
+
+
+def activate_account(base_url: str, account_id: str) -> None:
+    if not account_id or account_id in {"manual", "saved"}:
+        return
+    config = load_config()
+    selected_base_url = normalize_base_url(base_url)
+    accounts = config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, [])
+    account = next((item for item in accounts if item.get("id") == account_id), None)
+    if not account:
+        return
+    config.setdefault("activeAccounts", {})[ACCOUNT_POOL_KEY] = account_id
+    config.setdefault("cookies", {})[selected_base_url] = str(account.get("cookie") or "")
+    save_config(config)
+
+
+def update_account_quota(base_url: str, cookie: str, limit_info: dict) -> None:
+    cookie = cookie.strip()
+    if not cookie:
+        return
+    selected_base_url = normalize_base_url(base_url)
+    config = load_config()
+    changed = False
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        if str(account.get("cookie") or "").strip() != cookie:
+            continue
+        limit = int(limit_info.get("limit") or 0)
+        usage = int(limit_info.get("usage") or 0)
+        account["lastLimit"] = limit
+        account["lastUsage"] = usage
+        account["lastRemaining"] = max(limit - usage, 0)
+        account["lastCheckedAt"] = time.time()
+        account["lastResetInSeconds"] = limit_info.get("resetInSeconds")
+        account["lastResetText"] = format_reset_time(limit_info.get("resetInSeconds"))
+        account["lastError"] = ""
+        changed = True
+    if changed:
+        save_config(config)
+
+
+def update_account_error(base_url: str, cookie: str, error: str) -> None:
+    cookie = cookie.strip()
+    if not cookie:
+        return
+    selected_base_url = normalize_base_url(base_url)
+    config = load_config()
+    changed = False
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        if str(account.get("cookie") or "").strip() != cookie:
+            continue
+        account["lastError"] = error[:200]
+        account["lastCheckedAt"] = time.time()
+        changed = True
+    if changed:
+        save_config(config)
+
+
+def enabled_account_cookies(base_url: str) -> list[str]:
+    selected_base_url = normalize_base_url(base_url)
+    config = load_config()
+    cookies = []
+    seen = set()
+    for account in config.get("accountPools", {}).get(ACCOUNT_POOL_KEY, []):
+        cookie = str(account.get("cookie") or "").strip()
+        if not account.get("enabled", True) or not cookie or cookie in seen:
+            continue
+        cookies.append(cookie)
+        seen.add(cookie)
+    if not cookies:
+        fallback = str((config.get("cookies") or {}).get(selected_base_url) or "").strip()
+        if fallback:
+            cookies.append(fallback)
+    return cookies
+
+
+def get_account_pool_limit_info(base_url: str) -> dict | None:
+    selected_base_url = normalize_base_url(base_url)
+    refresh_playwright_account_cookie(selected_base_url)
+    cookies = enabled_account_cookies(selected_base_url)
+    if not cookies:
+        return None
+    total_limit = 0
+    total_usage = 0
+    reset_values = []
+    checked = 0
+    errors = []
+    for cookie in cookies:
+        try:
+            limit_info = get_image_limit(make_session(cookie), base_url=selected_base_url)
+            update_account_quota(selected_base_url, cookie, limit_info)
+            total_limit += int(limit_info.get("limit") or 0)
+            total_usage += int(limit_info.get("usage") or 0)
+            if limit_info.get("resetInSeconds") is not None:
+                reset_values.append(int(limit_info.get("resetInSeconds") or 0))
+            checked += 1
+        except Exception as exc:
+            update_account_error(selected_base_url, cookie, str(exc))
+            errors.append(str(exc))
+    if checked <= 0:
+        raise RuntimeError(errors[0] if errors else "账号池额度查询失败")
+    remaining = max(total_limit - total_usage, 0)
+    return {
+        "limit": total_limit,
+        "usage": total_usage,
+        "remaining": remaining,
+        "resetInSeconds": min(reset_values) if reset_values else None,
+        "accountCount": checked,
+        "errors": errors[:3],
+    }
+
+
+def run_process_once(command: list[str], output_dir: Path, cookie: str, log_func, owner: str) -> int:
+    child_env = os.environ.copy()
+    if cookie:
+        child_env["KOMIIC_COOKIE"] = cookie
+    else:
+        child_env.pop("KOMIIC_COOKIE", None)
+    process = subprocess.Popen(
+        command,
+        cwd=str(ROOT),
+        env=child_env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        start_new_session=True,
+    )
+    if owner == "job":
+        with JOB.lock:
+            JOB.process = process
+    else:
+        with BATCH.lock:
+            BATCH.process = process
+    assert process.stdout is not None
+    for line in process.stdout:
+        log_func(line)
+    returncode = process.wait()
+    if owner == "job":
+        with JOB.lock:
+            if JOB.process is process:
+                JOB.process = None
+    else:
+        with BATCH.lock:
+            if BATCH.process is process:
+                BATCH.process = None
+    log_func(f"进程退出，代码: {returncode}")
+    return returncode
+
+
+def run_command_with_account_rotation(
+    command: list[str],
+    output_dir: Path,
+    payload: dict,
+    base_url: str,
+    log_func,
+    owner: str,
+    stopped_func=lambda: False,
+) -> tuple[int, dict]:
+    last_code = 1
+    used_account = {}
+    for account in account_candidates(payload, base_url):
+        if stopped_func():
+            return 130, account
+        used_account = account
+        name = account.get("name") or "账号"
+        log_func(f"使用账号: {name}")
+        activate_account(base_url, str(account.get("id") or ""))
+        if account.get("playwrightProfile"):
+            refreshed = refresh_playwright_account_cookie(base_url, str(account.get("id") or ""), log_func=log_func)
+            if refreshed:
+                account["cookie"] = str(refreshed.get("cookie") or account.get("cookie") or "")
+        last_code = run_process_once(command, output_dir, str(account.get("cookie") or ""), log_func, owner)
+        if last_code != QUOTA_EXCEEDED_EXIT_CODE:
+            return last_code, account
+        log_func(f"账号「{name}」额度用完，切换下一个账号继续。")
+    return last_code, used_account
 
 
 def build_command(payload: dict) -> tuple[list[str], Path, str]:
@@ -2656,34 +4184,81 @@ def remember_payload_comic(payload: dict, title: str = "") -> None:
     remember_comic(base_url, url, title)
 
 
-def pump_output(process: subprocess.Popen[str]) -> None:
-    assert process.stdout is not None
-    for line in process.stdout:
-        JOB.append_log(line)
-
-
-def wait_for_job(process: subprocess.Popen[str]) -> None:
-    returncode = process.wait()
+def job_stopped() -> bool:
     with JOB.lock:
-        JOB.returncode = returncode
-        JOB.finished_at = time.time()
-        if JOB.status == "stopping":
-            JOB.status = "stopped"
+        return JOB.status == "stopping"
+
+
+def job_worker(payload: dict, command: list[str], output_dir: Path, history_id: str) -> None:
+    base_url = payload_base_url(payload)
+    returncode = 1
+    final_job_status = "failed"
+    try:
+        update_download_history(history_id, status="running", message="正在下载")
+        returncode, account = run_command_with_account_rotation(
+            command,
+            output_dir,
+            payload,
+            base_url,
+            JOB.append_log,
+            "job",
+            stopped_func=job_stopped,
+        )
+        missing, title = missing_chapters_for_url(payload)
+        downloaded = 0
+        total = 0
+        try:
+            chapters_payload = fetch_chapters(payload)
+            total = int(chapters_payload.get("total") or 0)
+            downloaded = int(chapters_payload.get("completed") or 0)
+        except Exception:
+            pass
+        remember_payload_comic(payload, title)
+        if job_stopped():
+            status = "stopped"
+            message = "已停止"
+        elif missing:
+            status = "missing"
+            message = f"仍缺 {len(missing)} 章"
+        elif returncode == 0:
+            status = "done"
+            message = f"完成，账号: {account.get('name') or '-'}"
         else:
-            JOB.status = "done" if returncode == 0 else "failed"
-        JOB.process = None
-    JOB.append_log(f"进程退出，代码: {returncode}")
+            status = "failed"
+            message = f"下载进程退出代码 {returncode}"
+        final_job_status = status
+        update_download_history(history_id, status=status, title=title, downloaded=downloaded, missing=len(missing), total=total, message=message)
+    except Exception as exc:
+        returncode = 1
+        final_job_status = "failed"
+        update_download_history(history_id, status="failed", message=str(exc))
+        JOB.append_log(f"任务失败: {exc}")
+    finally:
+        if payload.get("autoCopyCbz") and final_job_status not in {"failed", "stopped"}:
+            auto_copy_recent_cbz(output_dir, JOB.append_log)
+        with JOB.lock:
+            JOB.returncode = returncode
+            JOB.finished_at = time.time()
+            if JOB.status == "stopping":
+                JOB.status = "stopped"
+            elif final_job_status in {"done", "retried"}:
+                JOB.status = "done"
+            else:
+                JOB.status = "failed"
+            JOB.process = None
 
 
 def start_job(payload: dict) -> dict:
-    command, output_dir, cookie = build_command(payload)
-    remember_payload_comic(payload)
+    command, output_dir, _ = build_command(payload)
+    base_url = payload_base_url(payload)
+    url = str(payload.get("url") or "").strip()
     with JOB.lock:
-        if JOB.process is not None and JOB.process.poll() is None:
+        if JOB.status == "running" or (JOB.process is not None and JOB.process.poll() is None):
             raise RuntimeError("已有任务正在运行")
     with BATCH.lock:
         if BATCH.status == "running":
             raise RuntimeError("批量下载正在运行")
+    history_id = create_download_history(url=url, base_url=base_url, task_type="single", status="queued", message="等待下载")
     with JOB.lock:
         JOB.status = "running"
         JOB.started_at = time.time()
@@ -2694,28 +4269,7 @@ def start_job(payload: dict) -> dict:
         JOB.output_dir = str(output_dir)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    child_env = os.environ.copy()
-    if cookie:
-        child_env["KOMIIC_COOKIE"] = cookie
-    else:
-        child_env.pop("KOMIIC_COOKIE", None)
-
-    process = subprocess.Popen(
-        command,
-        cwd=str(ROOT),
-        env=child_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
-    )
-
-    with JOB.lock:
-        JOB.process = process
-
-    threading.Thread(target=pump_output, args=(process,), daemon=True).start()
-    threading.Thread(target=wait_for_job, args=(process,), daemon=True).start()
+    threading.Thread(target=job_worker, args=(payload, command, output_dir, history_id), daemon=True).start()
     return JOB.snapshot()
 
 
@@ -2734,7 +4288,7 @@ def missing_chapters_for_url(payload: dict) -> tuple[list[dict[str, str]], str]:
         raise ValueError("链接不能为空")
     base_url = payload_base_url(payload)
     output_dir = safe_output_dir(str(payload.get("output") or DEFAULT_OUTPUT))
-    session = make_session(payload_cookie(payload, base_url))
+    session = make_session(payload_cookie_with_refresh(payload, base_url))
     chapters = get_chapters(session, url, base_url=base_url)
     comic_title = chapters[0].comic_title if chapters else url
     missing = [
@@ -2754,7 +4308,7 @@ def fetch_chapters(payload: dict) -> dict:
     if not url:
         raise ValueError("链接不能为空")
     base_url = payload_base_url(payload)
-    session = make_session(payload_cookie(payload, base_url))
+    session = make_session(payload_cookie_with_refresh(payload, base_url))
     chapters = get_chapters(session, url, base_url=base_url)
     output_dir = safe_output_dir(str(payload.get("output") or DEFAULT_OUTPUT))
     completed_ids = {
@@ -2787,14 +4341,15 @@ def fetch_chapters(payload: dict) -> dict:
 def fetch_quota(payload: dict) -> dict:
     base_url = payload_base_url(payload)
     cookie = payload_cookie(payload, base_url)
-    session = make_session(cookie)
-    limit_info = get_image_limit(session, base_url=base_url)
+    if cookie and payload_has_manual_cookie(payload):
+        remember_cookie(base_url, cookie)
+    limit_info = get_account_pool_limit_info(base_url)
+    if not limit_info:
+        raise RuntimeError("账号池没有可用 Cookie，无法查询额度")
     record = remember_quota(base_url, limit_info)
     limit = int(limit_info.get("limit") or 0)
     usage = int(limit_info.get("usage") or 0)
     remaining = max(limit - usage, 0)
-    if cookie:
-        remember_cookie(base_url, cookie)
     return {
         "limit": limit,
         "usage": usage,
@@ -2808,11 +4363,11 @@ def fetch_quota(payload: dict) -> dict:
 def fetch_quota_poll(payload: dict) -> dict:
     base_url = payload_base_url(payload)
     cookie = payload_cookie(payload, base_url)
-    if cookie:
+    if cookie and payload_has_manual_cookie(payload):
         remember_cookie(base_url, cookie)
     record = poll_quota_once(base_url)
     if not record:
-        raise RuntimeError("没有可用 Cookie，无法自动拉取额度")
+        raise RuntimeError("账号池没有可用 Cookie，无法自动拉取额度")
     return {"record": record, **quota_history_payload(base_url)}
 
 
@@ -2835,35 +4390,6 @@ def batch_append_log(line: str) -> None:
     BATCH.append_log(line)
 
 
-def run_batch_process(command: list[str], output_dir: Path, cookie: str) -> int:
-    child_env = os.environ.copy()
-    if cookie:
-        child_env["KOMIIC_COOKIE"] = cookie
-    else:
-        child_env.pop("KOMIIC_COOKIE", None)
-    process = subprocess.Popen(
-        command,
-        cwd=str(ROOT),
-        env=child_env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        start_new_session=True,
-    )
-    with BATCH.lock:
-        BATCH.process = process
-    assert process.stdout is not None
-    for line in process.stdout:
-        batch_append_log(line)
-    returncode = process.wait()
-    with BATCH.lock:
-        if BATCH.process is process:
-            BATCH.process = None
-    batch_append_log(f"进程退出，代码: {returncode}")
-    return returncode
-
-
 def batch_stopped() -> bool:
     with BATCH.lock:
         return BATCH.stop_requested
@@ -2879,14 +4405,60 @@ def batch_result_for_url(url: str, status: str, title: str = "", missing: list[d
     }
 
 
+def estimate_batch(payload: dict) -> dict:
+    urls = batch_urls(payload)
+    base_url = payload_base_url(payload)
+    output_dir = safe_output_dir(str(payload.get("output") or DEFAULT_OUTPUT))
+    session = make_session(payload_cookie_with_refresh(payload, base_url))
+    results = []
+    total_pages = 0
+    total_missing_chapters = 0
+    for url in urls:
+        try:
+            chapters = get_chapters(session, url, base_url=base_url)
+            title = chapters[0].comic_title if chapters else url
+            missing = [chapter for chapter in chapters if not is_chapter_complete(output_dir, chapter)]
+            pages = sum(max(int(chapter.size or 0), 0) for chapter in missing)
+            total_pages += pages
+            total_missing_chapters += len(missing)
+            results.append(
+                {
+                    "url": url,
+                    "title": title,
+                    "totalChapters": len(chapters),
+                    "downloadedChapters": len(chapters) - len(missing),
+                    "missingChapters": len(missing),
+                    "pages": pages,
+                }
+            )
+        except Exception as exc:
+            results.append(
+                {
+                    "url": url,
+                    "title": url,
+                    "totalChapters": 0,
+                    "downloadedChapters": 0,
+                    "missingChapters": 0,
+                    "pages": 0,
+                    "error": str(exc),
+                }
+            )
+    return {
+        "baseUrl": base_url,
+        "totalComics": len(urls),
+        "totalPages": total_pages,
+        "missingChapters": total_missing_chapters,
+        "results": results,
+    }
+
+
 def batch_worker(payload: dict) -> None:
     base_url = payload_base_url(payload)
     output_dir = safe_output_dir(str(payload.get("output") or DEFAULT_OUTPUT))
-    cookie = payload_cookie(payload, base_url)
     base_payload = {
         "baseUrl": base_url,
         "output": str(output_dir),
-        "cookie": cookie,
+        "cookie": str(payload.get("cookie") or "").strip(),
         "maxChapters": 0,
         "downloadAll": True,
         "imageDelay": payload.get("imageDelay") or 1,
@@ -2910,18 +4482,58 @@ def batch_worker(payload: dict) -> None:
                 BATCH.current_index = index
             comic_payload = {**base_payload, "url": url, "selectedChapterIds": []}
             batch_append_log(f"\n===== [{index + 1}/{len(urls)}] 开始下载: {url} =====")
+            history_id = create_download_history(url=url, base_url=base_url, task_type="batch", status="running", message="批量下载中")
             try:
+                initial_missing, title = missing_chapters_for_url(comic_payload)
+                remember_comic(base_url, url, title)
+                total = len(initial_missing)
+                downloaded = 0
+                try:
+                    chapters_payload = fetch_chapters(comic_payload)
+                    total = int(chapters_payload.get("total") or total)
+                    downloaded = int(chapters_payload.get("completed") or 0)
+                except Exception:
+                    pass
+                if not initial_missing:
+                    status = "done"
+                    error = "已完整，跳过下载"
+                    missing = []
+                    returncode = 0
+                    update_download_history(history_id, status=status, title=title, total=total, downloaded=downloaded, missing=0, message=error)
+                    results.append(batch_result_for_url(url, status, title, missing, error))
+                    with BATCH.lock:
+                        BATCH.results = results
+                    index += 1
+                    continue
+                batch_append_log(f"检测到未下载章节 {len(initial_missing)} 个，将只下载缺失章节")
+                comic_payload = {**comic_payload, "selectedChapterIds": [item["id"] for item in initial_missing]}
                 command, _, _ = build_command(comic_payload)
-                returncode = run_batch_process(command, output_dir, cookie)
-                missing, title = missing_chapters_for_url(comic_payload)
+                returncode, account = run_command_with_account_rotation(
+                    command,
+                    output_dir,
+                    comic_payload,
+                    base_url,
+                    batch_append_log,
+                    "batch",
+                    stopped_func=batch_stopped,
+                )
+                missing, title = missing_chapters_for_url({**comic_payload, "selectedChapterIds": []})
                 remember_comic(base_url, url, title)
                 if missing and not batch_stopped():
                     ids = [item["id"] for item in missing]
                     batch_append_log(f"回测发现未完成章节 {len(ids)} 个，重试一次: {', '.join(ids)}")
                     retry_payload = {**comic_payload, "selectedChapterIds": ids}
                     retry_command, _, _ = build_command(retry_payload)
-                    retry_code = run_batch_process(retry_command, output_dir, cookie)
-                    missing, title = missing_chapters_for_url(comic_payload)
+                    retry_code, account = run_command_with_account_rotation(
+                        retry_command,
+                        output_dir,
+                        retry_payload,
+                        base_url,
+                        batch_append_log,
+                        "batch",
+                        stopped_func=batch_stopped,
+                    )
+                    missing, title = missing_chapters_for_url({**comic_payload, "selectedChapterIds": []})
                     if missing:
                         status = "missing"
                         error = f"重试后仍缺 {len(missing)} 章"
@@ -2937,10 +4549,19 @@ def batch_worker(payload: dict) -> None:
                 else:
                     status = "failed"
                     error = f"下载进程退出代码 {returncode}"
+                try:
+                    chapters_payload = fetch_chapters({**comic_payload, "selectedChapterIds": []})
+                    total = int(chapters_payload.get("total") or total)
+                    downloaded = int(chapters_payload.get("completed") or downloaded)
+                except Exception:
+                    downloaded = max(total - len(missing), 0)
+                message = error or {"done": "完成", "retried": "重试后完成", "missing": "仍缺章节", "failed": "下载失败"}.get(status, status)
+                update_download_history(history_id, status=status, title=title, total=total, downloaded=downloaded, missing=len(missing), message=message)
                 results.append(batch_result_for_url(url, status, title, missing, error))
             except Exception as exc:
                 final_status = "failed" if final_status != "stopped" else final_status
                 batch_append_log(f"任务失败: {exc}")
+                update_download_history(history_id, status="failed", message=str(exc))
                 results.append(batch_result_for_url(url, "failed", url, [], str(exc)))
             with BATCH.lock:
                 BATCH.results = results
@@ -2967,6 +4588,8 @@ def batch_worker(payload: dict) -> None:
             if any(result["status"] in {"failed", "missing"} for result in results):
                 final_status = "failed"
     finally:
+        if payload.get("autoCopyCbz") and final_status != "stopped":
+            auto_copy_recent_cbz(output_dir, batch_append_log)
         with BATCH.lock:
             BATCH.status = final_status
             BATCH.finished_at = time.time()
@@ -3030,6 +4653,8 @@ def stop_job() -> dict:
     with JOB.lock:
         process = JOB.process
         if process is None or process.poll() is not None:
+            if JOB.status == "running":
+                JOB.status = "stopping"
             return JOB.snapshot()
         JOB.status = "stopping"
 
@@ -3159,6 +4784,51 @@ def files_payload(output: str) -> dict:
     return {"tree": tree, "summary": count_file_tree(tree)}
 
 
+def copy_cbz_files(payload: dict) -> dict:
+    source_dir = safe_output_dir(str(payload.get("output") or DEFAULT_OUTPUT))
+    target_dir = Path(str(payload.get("target") or DEFAULT_CBZ_COPY_TARGET)).expanduser().resolve()
+    if not source_dir.exists() or not source_dir.is_dir():
+        raise RuntimeError("输出目录不存在")
+    if not str(payload.get("target") or DEFAULT_CBZ_COPY_TARGET).strip():
+        raise RuntimeError("未配置 CBZ 复制目录，请在 .komiic_local_paths.json 设置 cbzCopyTarget")
+    if not target_dir.exists() or not target_dir.is_dir():
+        raise RuntimeError("目标目录不存在")
+    config = load_config()
+    copy_since = float(payload.get("since") if payload.get("since") is not None else config.get("cbzCopySince") or 0)
+    copied = 0
+    skipped = 0
+    for cbz_path in sorted(source_dir.rglob("*.cbz")):
+        if not cbz_path.is_file():
+            continue
+        if copy_since and cbz_path.stat().st_mtime <= copy_since:
+            skipped += 1
+            continue
+        destination = target_dir / cbz_path.name
+        if destination.exists() and destination.resolve() != cbz_path.resolve():
+            if destination.stat().st_size == cbz_path.stat().st_size:
+                skipped += 1
+                continue
+            stem = cbz_path.stem
+            suffix = cbz_path.suffix
+            index = 2
+            while destination.exists():
+                destination = target_dir / f"{stem} ({index}){suffix}"
+                index += 1
+        shutil.copy2(cbz_path, destination)
+        copied += 1
+    config["cbzCopySince"] = time.time()
+    save_config(config)
+    return {"copied": copied, "skipped": skipped, "target": str(target_dir)}
+
+
+def auto_copy_recent_cbz(output_dir: Path, log_func) -> None:
+    try:
+        result = copy_cbz_files({"output": str(output_dir)})
+        log_func(f"已复制新增 CBZ {result.get('copied', 0)} 个到 {result.get('target')}")
+    except Exception as exc:
+        log_func(f"复制新增 CBZ 失败: {exc}")
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "KomiicGui/1.0"
 
@@ -3168,7 +4838,12 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
         if parsed.path == "/":
-            body = INDEX_HTML.encode("utf-8")
+            html_body = (
+                INDEX_HTML
+                .replace("__DEFAULT_OUTPUT_VALUE__", html.escape(DEFAULT_OUTPUT, quote=True))
+                .replace("__DEFAULT_OUTPUT_JSON__", json.dumps(DEFAULT_OUTPUT, ensure_ascii=False))
+            )
+            body = html_body.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(body)))
@@ -3191,6 +4866,11 @@ class Handler(BaseHTTPRequestHandler):
         if parsed.path == "/api/config":
             base_url = parse_qs(parsed.query).get("baseUrl", [""])[0]
             json_response(self, HTTPStatus.OK, config_payload(base_url))
+            return
+
+        if parsed.path == "/api/accounts":
+            base_url = parse_qs(parsed.query).get("baseUrl", [""])[0]
+            json_response(self, HTTPStatus.OK, account_pool_payload(base_url))
             return
 
         if parsed.path == "/api/quota/history":
@@ -3253,11 +4933,38 @@ class Handler(BaseHTTPRequestHandler):
             if parsed.path == "/api/quota/poll":
                 json_response(self, HTTPStatus.OK, fetch_quota_poll(read_json(self)))
                 return
+            if parsed.path == "/api/accounts":
+                json_response(self, HTTPStatus.OK, update_accounts(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/add-current":
+                json_response(self, HTTPStatus.OK, add_current_cookie_to_accounts(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/select":
+                json_response(self, HTTPStatus.OK, select_account(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/delete":
+                json_response(self, HTTPStatus.OK, delete_account(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/toggle":
+                json_response(self, HTTPStatus.OK, toggle_account(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/rename":
+                json_response(self, HTTPStatus.OK, rename_account(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/update-cookie":
+                json_response(self, HTTPStatus.OK, update_account_cookie(read_json(self)))
+                return
+            if parsed.path == "/api/accounts/refresh-cookie":
+                json_response(self, HTTPStatus.OK, refresh_account_cookie(read_json(self)))
+                return
             if parsed.path == "/api/batch/start":
                 json_response(self, HTTPStatus.OK, start_batch(read_json(self)))
                 return
             if parsed.path == "/api/batch/append":
                 json_response(self, HTTPStatus.OK, append_batch(read_json(self)))
+                return
+            if parsed.path == "/api/batch/estimate":
+                json_response(self, HTTPStatus.OK, estimate_batch(read_json(self)))
                 return
             if parsed.path == "/api/batch/stop":
                 json_response(self, HTTPStatus.OK, stop_batch())
@@ -3278,9 +4985,15 @@ class Handler(BaseHTTPRequestHandler):
                     delete_comic_history(str(payload.get("baseUrl") or DEFAULT_BASE_URL), str(payload.get("comicId") or "")),
                 )
                 return
+            if parsed.path == "/api/history/follow":
+                json_response(self, HTTPStatus.OK, toggle_follow_comic(read_json(self)))
+                return
             if parsed.path == "/api/choose-directory":
                 payload = read_json(self)
                 json_response(self, HTTPStatus.OK, choose_directory(str(payload.get("path") or DEFAULT_OUTPUT)))
+                return
+            if parsed.path == "/api/files/copy-cbz":
+                json_response(self, HTTPStatus.OK, copy_cbz_files(read_json(self)))
                 return
             if parsed.path == "/api/stop":
                 json_response(self, HTTPStatus.OK, stop_job())

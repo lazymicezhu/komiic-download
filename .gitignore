@@ -4,5 +4,6 @@ __pycache__/
 downloads/
 .venv/
 .komiic_gui_config.json
+.komiic_local_paths.json
 .komiic_playwright_profile/
 gui_server.log
